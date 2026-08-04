@@ -140,6 +140,12 @@ def normalize_units(df: pd.DataFrame) -> pd.DataFrame:
     if tp_k_cols:
         tp_mean_k = df[tp_k_cols].mean(axis=1)
         df["prod_avg_k"] = df["prod_avg_k"].fillna(tp_mean_k)
+        
+    # Also compute prod_min_k: the lowest reading among all TP probes at each timestep
+    # This approximates the ice-front temperature when probes are fully immersed,
+    # as the coldest probe is typically closest to the sublimation front.
+    if tp_k_cols:
+        df["prod_min_k"] = df[tp_k_cols].min(axis=1)
 
     # --- SANITY CHECK: Temperature gradient analysis ---
     # During PRIMARY DRYING: Shelf is heated, product is cold due to sublimation cooling
