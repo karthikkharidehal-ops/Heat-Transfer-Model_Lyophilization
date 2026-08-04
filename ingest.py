@@ -128,6 +128,37 @@ def normalize_units(df: pd.DataFrame) -> pd.DataFrame:
         tp_mean_k = df[tp_k_cols].mean(axis=1)
         df["prod_avg_k"] = df["prod_avg_k"].fillna(tp_mean_k)
 
+    # --- SANITY CHECK: Temperature gradient analysis ---
+    # During PRIMARY DRYING: Shelf is heated, product is cold due to sublimation cooling
+    #   Expected: T_shelf > T_product (typically by 5-40C depending on conditions)
+    # During FREEZING/ANNEALING: Shelf is cooled, product cools down
+    #   Expected: T_product > T_shelf (transiently, until equilibrium)
+    # 
+    # Since we don't know which phase each row represents, we only flag extreme cases
+    # that suggest unit mismatches (C vs K) or sensor failures.
+    if "shelf_temp_k" in df.columns and "prod_avg_k" in df.columns:
+        delta_t = df["shelf_temp_k"] - df["prod_avg_k"]  # Positive means Shelf > Prod
+        
+        # Check for extreme differences (>80K suggests one temp is in wrong units)
+        extreme_mask = np.abs(delta_t) > 80
+        n_extreme = extreme_mask.sum()
+        if n_extreme > 0:
+            print(f"[warn] Extreme temperature differences detected: {n_extreme} rows.", file=sys.stderr)
+            print(f"[warn]   Delta T (Shelf-Prod) range: {delta_t.min():.2f}K to {delta_t.max():.2f}K", file=sys.stderr)
+            print(f"[warn]   This may indicate unit mismatches (C vs K) or sensor errors.", file=sys.stderr)
+        
+        # Report the general trend for user verification
+        pct_shelf_warmer = 100.0 * (delta_t > 0).sum() / len(df)
+        avg_delta = delta_t.mean()
+        print(f"[info] Temperature trend: Shelf > Product in {pct_shelf_warmer:.1f}% of rows (avg Delta T = {avg_delta:.2f}K)", file=sys.stderr)
+        
+        # Note: In some systems, radiative heat gain can cause T_prod > T_shelf even during primary drying.
+        # We no longer flag this as an error, but still report it for awareness.
+        if pct_shelf_warmer < 50:
+            print(f"[info]   Note: Product is warmer than Shelf in most rows.", file=sys.stderr)
+            print(f"[info]   This can occur due to radiative heating from chamber walls/doors.", file=sys.stderr)
+            print(f"[info]   The Pikal model will proceed, but verify data quality if fit fails.", file=sys.stderr)
+
     return df
 
 def flag_primary_drying_end(df: pd.DataFrame, tol_pa: float = 2.0, sustain_minutes: float = 20.0) -> pd.DataFrame:
