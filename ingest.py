@@ -106,21 +106,21 @@ def normalize_units(df: pd.DataFrame) -> pd.DataFrame:
     # Use vacuum_pa as the primary pressure for the model
     df["pressure_pa"] = df["vacuum_pa"]
 
-    # Temperature columns (all in °C, convert to K)
-    shelf_temp_c = _numeric_series(df, ["ShelfTemp", "Shelf Temp", "Shelf Temp (°C)", "Shelf Temp (C)"])
+    # Temperature columns (all in C, convert to K)
+    shelf_temp_c = _numeric_series(df, ["ShelfTemp", "Shelf Temp"])
     df["shelf_temp_k"] = shelf_temp_c + 273.15
 
-    shelf_setpt_c = _numeric_series(df, ["ShelfSetpt", "Shelf Setpt", "Shelf Setpt (°C)", "Shelf Setpt (C)"])
+    shelf_setpt_c = _numeric_series(df, ["ShelfSetpt", "Shelf Setpt"])
     df["shelf_setpt_k"] = shelf_setpt_c + 273.15
 
-    cond_temp_c = _numeric_series(df, ["CondTemp", "Cond Temp", "Cond Temp (°C)", "Cond Temp (C)"])
+    cond_temp_c = _numeric_series(df, ["CondTemp", "Cond Temp"])
     df["cond_temp_k"] = cond_temp_c + 273.15
 
-    prod_avg_c = _numeric_series(df, ["ProdAvg", "Prod Avg", "Prod Avg (°C)", "Prod Avg (C)"])
+    prod_avg_c = _numeric_series(df, ["ProdAvg", "Prod Avg"])
     df["prod_avg_k"] = prod_avg_c + 273.15
 
     for tp in TP_COLUMNS:
-        tp_c = _numeric_series(df, [tp, f"{tp} (°C)", f"{tp} (C)"])
+        tp_c = _numeric_series(df, [tp])
         df[f"{tp.lower()}_k"] = tp_c + 273.15
 
     tp_k_cols = [f"{tp.lower()}_k" for tp in TP_COLUMNS if f"{tp.lower()}_k" in df.columns]
