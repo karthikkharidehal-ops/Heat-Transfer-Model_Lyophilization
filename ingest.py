@@ -97,14 +97,27 @@ def build_timestamp(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_units(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
-    # Pressure columns with unit conversions
-    df["pirani_pa"] = _numeric_series(df, ["Pirani", "Pirani (mTorr)"]) * MTORR_TO_PA
-    df["vacuum_pa"] = _numeric_series(df, ["VACUUM", "Vacuum", "VACUUM (mTorr)"]) * MTORR_TO_PA
-    df["vac_setpt_pa"] = _numeric_series(df, ["VacSetpt", "Vac Setpt", "Vacuum Setpt"]) * MTORR_TO_PA
-    df["capman_pa"] = _numeric_series(df, ["PRESSURE", "Pressure", "Capman", "PRESSURE (mbar)"]) * MBAR_TO_PA
-
-    # Use vacuum_pa as the primary pressure for the model
-    df["pressure_pa"] = df["vacuum_pa"]
+    # --- Pressure Mapping (Single Source of Truth) ---
+    # We rely solely on the 'VACUUM' column (high-sensitivity mTorr gauge).
+    # The 'PRESSURE' column (mbar) is ignored due to low sensitivity (13 mbar floor).
+    
+    # Extract VACUUM (mTorr) and convert to Pa
+    vacuum_series = _numeric_series(df, ["VACUUM", "Vacuum"])
+    if vacuum_series.isna().all():
+        raise ValueError("Required column 'VACUUM' not found. Cannot proceed without high-sensitivity pressure data.")
+    
+    # Convert mTorr to Pa: 1 mTorr = 0.133322 Pa
+    df["capman_pa"] = vacuum_series * 0.133322
+    
+    # Aliases: pressure_pa and vacuum_pa both point to the same high-sensitivity data
+    df["pressure_pa"] = df["capman_pa"]
+    df["vacuum_pa"] = df["capman_pa"]
+    
+    # Pirani gauge (for convergence detection only)
+    df["pirani_pa"] = _numeric_series(df, ["Pirani", "Pirani (mTorr)"]) * 0.133322
+    
+    # Vacuum setpoint (optional, for reference)
+    df["vac_setpt_pa"] = _numeric_series(df, ["VacSetpt", "Vac Setpt", "Vacuum Setpt"]) * 0.133322
 
     # Temperature columns (all in C, convert to K)
     shelf_temp_c = _numeric_series(df, ["ShelfTemp", "Shelf Temp"])
