@@ -97,25 +97,30 @@ def build_timestamp(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_units(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
-    df["pirani_pa"] = _numeric_series(df, ["Pirani (mTorr)", "Pirani", "Pirani (mTorr) "]) * MTORR_TO_PA
-    df["vacuum_pa"] = _numeric_series(df, ["VACUUM (mTorr)", "Vacuum (mTorr)", "VACUUM", "Vacuum"]) * MTORR_TO_PA
-    df["vac_setpt_pa"] = _numeric_series(df, ["Vac Setpt (mTorr)", "Vac Setpt", "Vacuum Setpt (mTorr)"]) * MTORR_TO_PA
-    df["capman_pa"] = _numeric_series(df, ["PRESSURE (mbar)", "Pressure (mbar)", "PRESSURE", "Capman (mbar)"]) * MBAR_TO_PA
+    # Pressure columns with unit conversions
+    df["pirani_pa"] = _numeric_series(df, ["Pirani", "Pirani (mTorr)"]) * MTORR_TO_PA
+    df["vacuum_pa"] = _numeric_series(df, ["VACUUM", "Vacuum", "VACUUM (mTorr)"]) * MTORR_TO_PA
+    df["vac_setpt_pa"] = _numeric_series(df, ["VacSetpt", "Vac Setpt", "Vacuum Setpt"]) * MTORR_TO_PA
+    df["capman_pa"] = _numeric_series(df, ["PRESSURE", "Pressure", "Capman", "PRESSURE (mbar)"]) * MBAR_TO_PA
 
-    shelf_temp_c = _numeric_series(df, ["Shelf Temp (C)", "Shelf Temp (째C)", "Shelf Temp"])
+    # Use vacuum_pa as the primary pressure for the model
+    df["pressure_pa"] = df["vacuum_pa"]
+
+    # Temperature columns (all in 캜, convert to K)
+    shelf_temp_c = _numeric_series(df, ["ShelfTemp", "Shelf Temp", "Shelf Temp (캜)", "Shelf Temp (C)"])
     df["shelf_temp_k"] = shelf_temp_c + 273.15
 
-    shelf_setpt_c = _numeric_series(df, ["Shelf Setpt (C)", "Shelf Setpt (째C)", "Shelf Setpt"])
+    shelf_setpt_c = _numeric_series(df, ["ShelfSetpt", "Shelf Setpt", "Shelf Setpt (캜)", "Shelf Setpt (C)"])
     df["shelf_setpt_k"] = shelf_setpt_c + 273.15
 
-    cond_temp_c = _numeric_series(df, ["Cond Temp (C)", "Cond Temp (째C)", "Cond Temp"])
+    cond_temp_c = _numeric_series(df, ["CondTemp", "Cond Temp", "Cond Temp (캜)", "Cond Temp (C)"])
     df["cond_temp_k"] = cond_temp_c + 273.15
 
-    prod_avg_c = _numeric_series(df, ["Prod Avg (C)", "Prod Avg (째C)", "Prod Avg"])
+    prod_avg_c = _numeric_series(df, ["ProdAvg", "Prod Avg", "Prod Avg (캜)", "Prod Avg (C)"])
     df["prod_avg_k"] = prod_avg_c + 273.15
 
     for tp in TP_COLUMNS:
-        tp_c = _numeric_series(df, [f"{tp} (C)", f"{tp} (째C)", tp])
+        tp_c = _numeric_series(df, [tp, f"{tp} (캜)", f"{tp} (C)"])
         df[f"{tp.lower()}_k"] = tp_c + 273.15
 
     tp_k_cols = [f"{tp.lower()}_k" for tp in TP_COLUMNS if f"{tp.lower()}_k" in df.columns]
