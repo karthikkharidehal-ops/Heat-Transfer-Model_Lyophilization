@@ -46,6 +46,47 @@ python run_pipeline.py your_historian_export.csv \
     --calib 6:1.8 12:2.9 20:4.1
 ```
 
+### Handling fully-immersed probes (ice-front temperature)
+
+When thermocouples are completely immersed in the liquid with metal parts exposed to different sections of the freezing front, the **lowest probe reading** best approximates the ice-front temperature. Use:
+
+```
+python run_pipeline.py your_historian_export.csv \
+    --primary-phase-code 6 \
+    --fill-volume-ul 12 \
+    --calib 6:1.8 12:2.9 20:4.1 \
+    --use-min-temp
+```
+
+This uses `prod_min_k` (minimum of TP01-TP04) instead of `prod_avg_k`.
+
+### Handling multi-step ramps (4-5 ramp steps)
+
+The steady-state assumption breaks down during frequent setpoint changes. Enable transient mode:
+
+```
+python run_pipeline.py your_historian_export.csv \
+    --primary-phase-code 6 \
+    --fill-volume-ul 12 \
+    --calib 6:1.8 12:2.9 20:4.1 \
+    --use-transient
+```
+
+This adds a heat accumulation term to account for non-steady conditions during ramp steps.
+
+### Using both features together
+
+For fully-immersed probes with multi-step ramps:
+
+```
+python run_pipeline.py your_historian_export.csv \
+    --primary-phase-code 6 \
+    --fill-volume-ul 12 \
+    --calib 6:1.8 12:2.9 20:4.1 \
+    --use-min-temp \
+    --use-transient
+```
+
 You know your `Phase` column's numeric coding (freezing / primary /
 secondary / storage) — I don't, so pass whichever code corresponds to
 Primary Drying. The script segments by `(Cycle, Step)` within that

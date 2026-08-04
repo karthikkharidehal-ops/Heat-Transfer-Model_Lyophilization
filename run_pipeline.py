@@ -236,42 +236,74 @@ def choose_pressure_column(df):
     )
 
 
-def choose_product_temperature_column(df):
+def choose_product_temperature_column(df, use_min=False):
     """
     Choose product temperature column.
 
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Cleaned data frame with temperature columns.
+    use_min : bool, optional
+        If True, use the minimum probe reading (prod_min_k) to approximate
+        the ice-front temperature when probes are fully immersed.
+        If False (default), use the average (prod_avg_k).
+
     Preferred:
-      prod_avg_k
+      - If use_min=True: prod_min_k
+      - If use_min=False: prod_avg_k
 
     Fallback:
-      mean of TPxx_k columns
+      mean of TPxx_k columns (or min if use_min=True)
 
     Writes result to df['product_temp_k'].
     """
-    if "prod_avg_k" in df.columns and df["prod_avg_k"].notna().any():
-        df["product_temp_k"] = df["prod_avg_k"]
-        return "prod_avg_k"
+    if use_min:
+        if "prod_min_k" in df.columns and df["prod_min_k"].notna().any():
+            df["product_temp_k"] = df["prod_min_k"]
+            return "prod_min_k"
 
-    tp_cols = [
-        col
-        for col in df.columns
-        if col.lower().startswith("tp") and col.lower().endswith("_k")
-    ]
+        tp_cols = [
+            col
+            for col in df.columns
+            if col.lower().startswith("tp") and col.lower().endswith("_k")
+        ]
 
-    if tp_cols:
-        df["product_temp_k"] = df[tp_cols].mean(axis=1)
+        if tp_cols:
+            df["product_temp_k"] = df[tp_cols].min(axis=1)
 
-        print(
-            f"[warn] prod_avg_k not usable; using mean of {tp_cols} "
-            "as product temperature.",
-            file=sys.stderr,
-        )
+            print(
+                f"[warn] prod_min_k not usable; using min of {tp_cols} "
+                "as product temperature (ice-front approximation).",
+                file=sys.stderr,
+            )
 
-        return f"mean({', '.join(tp_cols)})"
+            return f"min({', '.join(tp_cols)})"
+    else:
+        if "prod_avg_k" in df.columns and df["prod_avg_k"].notna().any():
+            df["product_temp_k"] = df["prod_avg_k"]
+            return "prod_avg_k"
+
+        tp_cols = [
+            col
+            for col in df.columns
+            if col.lower().startswith("tp") and col.lower().endswith("_k")
+        ]
+
+        if tp_cols:
+            df["product_temp_k"] = df[tp_cols].mean(axis=1)
+
+            print(
+                f"[warn] prod_avg_k not usable; using mean of {tp_cols} "
+                "as product temperature.",
+                file=sys.stderr,
+            )
+
+            return f"mean({', '.join(tp_cols)})"
 
     raise ValueError(
         "No usable product temperature column found. "
-        "Expected prod_avg_k or TPxx_k columns."
+        "Expected prod_avg_k/prod_min_k or TPxx_k columns."
     )
 
 
@@ -407,6 +439,30 @@ def main():
         help="Output text report file",
     )
 
+    parser.add_argument(
+        "--use-min-temp",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the minimum probe reading (prod_min_k) instead of the average "
+            "(prod_avg_k) as the product temperature. This approximates the ice-front "
+            "temperature when probes are fully immersed and exposed to different "
+            "sections of the freezing front."
+        ),
+    )
+
+    parser.add_argument(
+        "--use-transient",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable transient heat accumulation mode in the Pikal model. This accounts "
+            "for non-steady conditions during multi-step ramps (4-5 ramp steps) where "
+            "the steady-state assumption breaks down. Recommended for recipes with "
+            "frequent shelf temperature or pressure changes."
+        ),
+    )
+
     args = parser.parse_args()
 
     if not args.input_csv.exists():
@@ -428,7 +484,7 @@ def main():
 
     # Choose model input columns.
     pressure_col = choose_pressure_column(df)
-    product_temp_col = choose_product_temperature_column(df)
+    product_temp_col = choose_product_temperature_column(df, use_min=args.use_min_temp)
 
     # Convert user inputs.
     phase_code = coerce_phase_code(df, args.primary_phase_code)
@@ -457,7 +513,7 @@ def main():
 
     # Run joint fit.
     try:
-        fitted = fit_parameters_joint(segments)
+        fitted = fit_parameters_joint(segments, use_transient=args.use_transient)
     except Exception as exc:
         raise SystemExit(f"[error] Joint fit failed: {exc}")
 
@@ -469,6 +525,8 @@ def main():
         f"Fill volume: {args.fill_volume_ul} uL",
         f"Pressure column used: {pressure_col}",
         f"Product temperature column used: {product_temp_col}",
+        f"Using minimum probe temperature (ice-front approx): {args.use_min_temp}",
+        f"Using transient mode (for multi-step ramps): {args.use_transient}",
         f"Calibration points used: {len(calibration_points)}",
         f"Segments used: {[s.label for s in segments]}",
         "",
