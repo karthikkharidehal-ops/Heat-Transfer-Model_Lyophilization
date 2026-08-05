@@ -244,7 +244,8 @@ class DryingSegment:
 def fit_parameters_joint(
     segments: list[DryingSegment], 
     initial_guess: dict | None = None,
-    use_transient: bool = False
+    use_transient: bool = False,
+    use_hybrid: bool = False
 ) -> dict:
     """Fit ONE shared {Kv, Rp0, A1, A2} across multiple segments.
     
@@ -257,6 +258,10 @@ def fit_parameters_joint(
     use_transient : bool, default False
         If True, use transient mode for simulation (recommended for multi-step ramps
         where steady-state assumption breaks down)
+    use_hybrid : bool, default False
+        If True, apply quasi-steady state for Hold steps (odd-numbered: 1,3,5,...)
+        and transient mode for Ramp steps (even-numbered: 2,4,6,...). This overrides
+        use_transient when enabled.
     """
     guess = initial_guess or dict(Kv=15.0, Rp0=2e4, A1=1e6, A2=100.0)
     x0 = np.array([guess["Kv"], guess["Rp0"], guess["A1"], guess["A2"]], dtype=float)
@@ -265,9 +270,25 @@ def fit_parameters_joint(
         Kv, Rp0, A1, A2 = x
         out = []
         for seg in segments:
+            # Determine if this segment should use transient or steady-state
+            seg_use_transient = use_transient
+            if use_hybrid:
+                # Extract step number from label (e.g., "cycle=1_step=2" -> step=2)
+                step_num = None
+                if "_step=" in seg.label:
+                    try:
+                        step_num = int(seg.label.split("_step=")[1])
+                    except (ValueError, IndexError):
+                        pass
+                
+                # Odd steps (1,3,5,...) are Hold steps -> steady-state (False)
+                # Even steps (2,4,6,...) are Ramp steps -> transient (True)
+                if step_num is not None:
+                    seg_use_transient = (step_num % 2 == 0)
+            
             Tp_sim = simulate_cycle(
                 seg.t_s, seg.Ts_k, seg.Pc_pa, seg.tube,
-                seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=use_transient
+                seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=seg_use_transient
             )
             out.append(Tp_sim - seg.Tp_measured_k)
         return np.concatenate(out)
@@ -286,9 +307,21 @@ def fit_parameters_joint(
     per_segment = {}
     Kv, Rp0, A1, A2 = x_vals
     for seg in segments:
+        # Determine if this segment should use transient or steady-state for reporting
+        seg_use_transient = use_transient
+        if use_hybrid:
+            step_num = None
+            if "_step=" in seg.label:
+                try:
+                    step_num = int(seg.label.split("_step=")[1])
+                except (ValueError, IndexError):
+                    pass
+            if step_num is not None:
+                seg_use_transient = (step_num % 2 == 0)
+        
         Tp_sim = simulate_cycle(
             seg.t_s, seg.Ts_k, seg.Pc_pa, seg.tube,
-            seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=use_transient
+            seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=seg_use_transient
         )
         per_segment[seg.label or f"segment_{id(seg)}"] = float(
             np.sqrt(np.mean((Tp_sim - seg.Tp_measured_k) ** 2))

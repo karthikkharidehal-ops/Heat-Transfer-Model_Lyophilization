@@ -87,6 +87,23 @@ python run_pipeline.py your_historian_export.csv \
     --use-transient
 ```
 
+### Hybrid mode: quasi-steady for Hold steps, transient for Ramp steps
+
+When your recipe has alternating Hold and Ramp steps (e.g., Step 1=Hold, Step 2=Ramp, Step 3=Hold, etc.), use hybrid mode. This automatically applies:
+- **Quasi-steady state** for odd-numbered steps (1, 3, 5, ...) — assumed to be Hold steps
+- **Transient mode** for even-numbered steps (2, 4, 6, ...) — assumed to be Ramp steps
+
+```
+python run_pipeline.py your_historian_export.csv \
+    --primary-phase-code 6 \
+    --fill-volume-ul 12 \
+    --calib 6:1.8 12:2.9 20:4.1 \
+    --use-min-temp \
+    --hybrid-mode
+```
+
+This is ideal when you have 4-5 ramp steps interleaved with hold steps, as it uses the appropriate physics model for each step type without manual configuration. The `--hybrid-mode` flag overrides `--use-transient` if both are provided.
+
 You know your `Phase` column's numeric coding (freezing / primary /
 secondary / storage) — I don't, so pass whichever code corresponds to
 Primary Drying. The script segments by `(Cycle, Step)` within that
