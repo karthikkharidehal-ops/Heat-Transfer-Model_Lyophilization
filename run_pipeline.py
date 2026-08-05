@@ -313,9 +313,26 @@ def build_segments(
     tube,
     fill_volume_m3,
     min_segment_points=5,
+    hold_step_threshold=20,
 ):
     """
     Build one DryingSegment per Cycle/Step combination inside Primary Drying.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Cleaned data frame
+    primary_phase_code : any
+        Phase code for primary drying
+    tube : PCRTubeGeometry
+        Geometry object
+    fill_volume_m3 : float
+        Fill volume in cubic meters
+    min_segment_points : int, default 5
+        Minimum number of valid rows per segment
+    hold_step_threshold : int, default 20
+        Number of consecutive data points with same shelf_setpt_k value
+        to classify as a hold step. Fewer than this indicates a ramp step.
     """
     missing = [col for col in REQUIRED_MODEL_COLUMNS if col not in df.columns]
 
@@ -364,6 +381,26 @@ def build_segments(
             )
             continue
 
+        # Detect if this is a hold step or ramp step based on shelf_setpt_k stability
+        # If shelf_setpt_k has more than threshold consecutive identical values, it's a hold step
+        is_hold_step = True  # Default to hold step
+        if "shelf_setpt_k" in group.columns:
+            shelf_setpt = group["shelf_setpt_k"].values
+            
+            # Find the maximum run length of consecutive identical values
+            # (accounting for floating point tolerance)
+            max_consecutive = 1
+            current_consecutive = 1
+            for i in range(1, len(shelf_setpt)):
+                if np.isclose(shelf_setpt[i], shelf_setpt[i-1], rtol=1e-5):
+                    current_consecutive += 1
+                    max_consecutive = max(max_consecutive, current_consecutive)
+                else:
+                    current_consecutive = 1
+            
+            # If max consecutive identical values < threshold, it's a ramp step
+            is_hold_step = (max_consecutive >= hold_step_threshold)
+
         t0 = group["timestamp"].iloc[0]
 
         t_s = (
@@ -379,6 +416,7 @@ def build_segments(
                 tube=tube,
                 fill_volume_m3=fill_volume_m3,
                 label=f"cycle={cycle_id}_step={step_id}",
+                is_hold_step=is_hold_step,
             )
         )
 
@@ -468,9 +506,10 @@ def main():
         action="store_true",
         default=False,
         help=(
-            "Use hybrid modeling: quasi-steady state for Hold steps (odd-numbered: 1,3,5,...) "
-            "and transient mode for Ramp steps (even-numbered: 2,4,6,...). This automatically "
-            "applies the appropriate physics based on step type. Overrides --use-transient."
+            "Use hybrid modeling: detect Hold vs Ramp steps based on shelf setpoint stability. "
+            "If shelf_setpt_k has >=20 consecutive identical values, it's a Hold step (steady-state). "
+            "Otherwise it's a Ramp step (transient mode). This automatically applies the appropriate "
+            "physics based on actual process behavior rather than step numbering. Overrides --use-transient."
         ),
     )
 
@@ -510,9 +549,20 @@ def main():
         primary_phase_code=phase_code,
         tube=tube,
         fill_volume_m3=fill_volume_m3,
+        hold_step_threshold=20,  # Detect hold vs ramp based on 20 consecutive identical shelf_setpt values
     )
 
     print(f"Built {len(segments)} segment(s): {[s.label for s in segments]}")
+    
+    # Report detected step types
+    if args.hybrid_mode:
+        hold_steps = [s.label for s in segments if s.is_hold_step]
+        ramp_steps = [s.label for s in segments if not s.is_hold_step]
+        print(f"[info] Hybrid mode: {len(hold_steps)} Hold step(s), {len(ramp_steps)} Ramp step(s)")
+        if hold_steps:
+            print(f"  Hold steps (steady-state): {hold_steps}")
+        if ramp_steps:
+            print(f"  Ramp steps (transient): {ramp_steps}")
 
     if len(segments) < 2:
         print(
@@ -546,7 +596,7 @@ def main():
         f"Product temperature column used: {product_temp_col}",
         f"Using minimum probe temperature (ice-front approx): {args.use_min_temp}",
         f"Using transient mode (for multi-step ramps): {use_transient and not use_hybrid}",
-        f"Using hybrid mode (steady for odd steps, transient for even): {use_hybrid}",
+        f"Using hybrid mode (shelf-setpt based Hold/Ramp detection): {use_hybrid}",
         f"Calibration points used: {len(calibration_points)}",
         f"Segments used: {[s.label for s in segments]}",
         "",
