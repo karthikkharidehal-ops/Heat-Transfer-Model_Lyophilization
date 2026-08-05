@@ -463,17 +463,6 @@ def main():
         ),
     )
 
-    parser.add_argument(
-        "--hybrid-mode",
-        action="store_true",
-        default=False,
-        help=(
-            "Use hybrid modeling: quasi-steady state for Hold steps (odd-numbered: 1,3,5,...) "
-            "and transient mode for Ramp steps (even-numbered: 2,4,6,...). This automatically "
-            "applies the appropriate physics based on step type. Overrides --use-transient."
-        ),
-    )
-
     args = parser.parse_args()
 
     if not args.input_csv.exists():
@@ -524,15 +513,7 @@ def main():
 
     # Run joint fit.
     try:
-        # Hybrid mode overrides use_transient if enabled
-        use_hybrid = args.hybrid_mode
-        use_transient = args.use_transient or use_hybrid
-        
-        fitted = fit_parameters_joint(
-            segments, 
-            use_transient=use_transient,
-            use_hybrid=use_hybrid
-        )
+        fitted = fit_parameters_joint(segments, use_transient=args.use_transient)
     except Exception as exc:
         raise SystemExit(f"[error] Joint fit failed: {exc}")
 
@@ -545,8 +526,7 @@ def main():
         f"Pressure column used: {pressure_col}",
         f"Product temperature column used: {product_temp_col}",
         f"Using minimum probe temperature (ice-front approx): {args.use_min_temp}",
-        f"Using transient mode (for multi-step ramps): {use_transient and not use_hybrid}",
-        f"Using hybrid mode (steady for odd steps, transient for even): {use_hybrid}",
+        f"Using transient mode (for multi-step ramps): {args.use_transient}",
         f"Calibration points used: {len(calibration_points)}",
         f"Segments used: {[s.label for s in segments]}",
         "",
