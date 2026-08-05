@@ -10,6 +10,7 @@ import os
 import sys
 import io
 import threading
+import tempfile
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template_string, send_file
 
@@ -593,7 +594,8 @@ def run_pipeline():
         log("=" * 60, 'info')
         
         # Save uploaded file temporarily
-        input_path = Path(f"/tmp/{input_file.filename}")
+        temp_dir = tempfile.gettempdir()
+        input_path = Path(temp_dir) / input_file.filename
         input_file.save(input_path)
         
         log(f"\nInput file: {input_file.filename}", 'info')
@@ -724,7 +726,7 @@ def run_pipeline():
             lines.append(f"  {label}: {rms:.6f} K")
         
         report = "\n".join(lines)
-        report_path = Path(f"/tmp/{report_out}")
+        report_path = Path(temp_dir) / report_out
         report_path.write_text(report, encoding="utf-8")
         log(f"  Saved report -> {report_out}", 'success')
         
@@ -779,7 +781,7 @@ def run_pipeline():
                     plt.tight_layout()
                     
                     plot_filename = f"residual_{seg.label.replace('=', '_').replace('cycle_', 'c').replace('step_', 's')}.png"
-                    plot_path = Path(f"/tmp/{plot_filename}")
+                    plot_path = Path(temp_dir) / plot_filename
                     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
                     log(f"  Saved: {plot_filename}", 'success')
                     plt.close(fig)
@@ -811,7 +813,7 @@ def run_pipeline():
 
 @app.route('/download/<filename>')
 def download(filename):
-    filepath = Path(f"/tmp/{filename}")
+    filepath = Path(tempfile.gettempdir()) / filename
     if filepath.exists():
         return send_file(filepath, as_attachment=True)
     return jsonify({'error': 'File not found'}), 404
