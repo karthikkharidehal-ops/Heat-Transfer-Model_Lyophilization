@@ -242,6 +242,114 @@ class DryingSegment:
     is_hold_step: bool = True  # Default to hold step (steady-state)
 
 
+def simulate_continuous_primary_drying(
+    segments: list[DryingSegment],
+    Kv: float, Rp0: float, A1: float, A2: float, Rs: float = 0.0,
+    use_hybrid: bool = False
+) -> list[np.ndarray]:
+    """Simulate primary drying continuously across multiple segments (Steps 2-9).
+    
+    This maintains continuity of:
+    - Dried layer thickness L (ice front position)
+    - Ice mass
+    - Product temperature Tp
+    
+    Across all segments, applying appropriate physics (steady-state vs transient)
+    based on whether each segment is a Hold or Ramp step.
+    
+    Parameters
+    ----------
+    segments : list[DryingSegment]
+        List of consecutive drying segments (must be in chronological order)
+    Kv, Rp0, A1, A2 : float
+        Fitted model parameters
+    Rs : float, default 0.0
+        Stopper/chamber resistance
+    use_hybrid : bool, default False
+        If True, use steady-state for Hold steps and transient for Ramp steps.
+        If False, use transient mode for all segments.
+        
+    Returns
+    -------
+    Tp_simulations : list[np.ndarray]
+        List of simulated product temperature arrays, one per segment
+    """
+    # Initialize state variables at the start of primary drying
+    # These will be carried forward across all segments
+    L = 0.0  # Dried layer thickness from top (m)
+    tube = segments[0].tube
+    fill_volume_m3 = segments[0].fill_volume_m3
+    fill_height = tube.fill_height(fill_volume_m3)
+    Av_base = tube.base_area_m2()
+    
+    # Initialize ice mass (full ice volume at start of primary drying)
+    initial_ice_volume = fill_volume_m3
+    ice_mass = RHO_ICE * initial_ice_volume
+    
+    # Initial product temperature guess
+    Tp_prev = segments[0].Ts_k[0] - 5.0  # Start ~5K below shelf temp
+    
+    all_Tp_sim = []
+    
+    for seg_idx, seg in enumerate(segments):
+        n = len(seg.t_s)
+        Tp_sim = np.zeros(n)
+        
+        # Determine physics mode for this segment
+        seg_use_transient = True  # Default to transient for continuity
+        if use_hybrid:
+            # Hold steps: steady-state (but still continue L and ice_mass)
+            # Ramp steps: transient
+            seg_use_transient = not seg.is_hold_step
+        
+        for i in range(n):
+            # Calculate product resistance based on current dried layer thickness
+            Rp = Rp0 + A1 * L / (1.0 + A2 * L)
+            
+            # Calculate front area based on current front position
+            A_front = tube.front_area_m2(fill_height, L)
+            
+            if seg_use_transient and i > 0:
+                # Transient mode: include heat accumulation term
+                dt = float(seg.t_s[i] - seg.t_s[i - 1])
+                flux, Tp_k = solve_Tp(
+                    float(seg.Ts_k[i]), float(seg.Pc_pa[i]), float(Rp), float(Rs),
+                    float(Av_base), float(A_front), float(Kv),
+                    Tp_prev_k=float(Tp_prev), dt=dt, ice_mass=float(ice_mass)
+                )
+                # Update ice mass based on sublimation
+                dmdt_total = flux * A_front
+                ice_mass -= max(dmdt_total * dt, 0.0)
+                ice_mass = max(ice_mass, 0.0)  # Can't go negative
+                Tp_prev = Tp_k
+            else:
+                # Steady-state mode (for Hold steps in hybrid mode)
+                # Still uses current L and ice_mass from previous segments
+                flux, Tp_k = solve_Tp(
+                    float(seg.Ts_k[i]), float(seg.Pc_pa[i]), float(Rp), float(Rs),
+                    float(Av_base), float(A_front), float(Kv)
+                )
+                # For steady-state, we still track ice mass but don't use accumulation term
+                dmdt_total = flux * A_front
+                if i > 0:
+                    dt = float(seg.t_s[i] - seg.t_s[i - 1])
+                    ice_mass -= max(dmdt_total * dt, 0.0)
+                    ice_mass = max(ice_mass, 0.0)
+                Tp_prev = Tp_k  # Still update for continuity
+            
+            Tp_sim[i] = Tp_k
+
+            # Update dried layer thickness for next timestep
+            if i < n - 1:
+                dt = float(seg.t_s[i + 1] - seg.t_s[i])
+                L += max(flux / RHO_ICE, 0.0) * dt
+                L = min(L, fill_height)  # Front can't pass tube bottom
+        
+        all_Tp_sim.append(Tp_sim)
+    
+    return all_Tp_sim
+
+
 def fit_parameters_joint(
     segments: list[DryingSegment], 
     initial_guess: dict | None = None,
@@ -250,38 +358,45 @@ def fit_parameters_joint(
 ) -> dict:
     """Fit ONE shared {Kv, Rp0, A1, A2} across multiple segments.
     
+    When use_hybrid=True or use_transient=True, the simulation maintains continuity
+    of dried layer thickness L, ice mass, and product temperature across all segments
+    (Steps 2-9 within Phase 6), applying appropriate physics (steady-state vs transient)
+    based on Hold/Ramp detection.
+    
     Parameters
     ----------
     segments : list[DryingSegment]
-        List of drying segments to fit jointly
+        List of drying segments to fit jointly (should be in chronological order)
     initial_guess : dict, optional
         Initial guess for parameters
     use_transient : bool, default False
-        If True, use transient mode for simulation (recommended for multi-step ramps
-        where steady-state assumption breaks down)
+        If True, maintain continuity of state variables across segments using
+        transient heat accumulation throughout
     use_hybrid : bool, default False
         If True, apply quasi-steady state for Hold steps (detected by shelf_setpt stability)
-        and transient mode for Ramp steps. This overrides use_transient when enabled.
+        and transient mode for Ramp steps, while maintaining state continuity across all steps.
+        This overrides use_transient when enabled.
     """
     guess = initial_guess or dict(Kv=15.0, Rp0=2e4, A1=1e6, A2=100.0)
     x0 = np.array([guess["Kv"], guess["Rp0"], guess["A1"], guess["A2"]], dtype=float)
 
     def resid(x: np.ndarray) -> np.ndarray:
         Kv, Rp0, A1, A2 = x
-        out = []
-        for seg in segments:
-            # Determine if this segment should use transient or steady-state
-            seg_use_transient = use_transient
-            if use_hybrid:
-                # Use the is_hold_step flag from the segment
-                # Hold steps -> steady-state (False), Ramp steps -> transient (True)
-                seg_use_transient = not seg.is_hold_step
-            
-            Tp_sim = simulate_cycle(
-                seg.t_s, seg.Ts_k, seg.Pc_pa, seg.tube,
-                seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=seg_use_transient
+        # Use continuous simulation across all segments
+        if use_transient or use_hybrid:
+            all_Tp_sim = simulate_continuous_primary_drying(
+                segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
             )
-            out.append(Tp_sim - seg.Tp_measured_k)
+            out = [all_Tp_sim[i] - segments[i].Tp_measured_k for i in range(len(segments))]
+        else:
+            # Legacy mode: independent segments (no state continuity)
+            out = []
+            for seg in segments:
+                Tp_sim = simulate_cycle(
+                    seg.t_s, seg.Ts_k, seg.Pc_pa, seg.tube,
+                    seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=False
+                )
+                out.append(Tp_sim - seg.Tp_measured_k)
         return np.concatenate(out)
 
     result = least_squares(resid, x0, bounds=(0, np.inf), xtol=1e-8, ftol=1e-8, max_nfev=4000)
@@ -295,21 +410,27 @@ def fit_parameters_joint(
     fitted["rms_error_k"] = float(np.sqrt(np.mean(fun_vals ** 2)))
     fitted["converged"] = bool(success)
 
+    # Calculate per-segment RMS errors using continuous simulation
     per_segment = {}
     Kv, Rp0, A1, A2 = x_vals
-    for seg in segments:
-        # Determine if this segment should use transient or steady-state for reporting
-        seg_use_transient = use_transient
-        if use_hybrid:
-            seg_use_transient = not seg.is_hold_step
-        
-        Tp_sim = simulate_cycle(
-            seg.t_s, seg.Ts_k, seg.Pc_pa, seg.tube,
-            seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=seg_use_transient
+    if use_transient or use_hybrid:
+        all_Tp_sim = simulate_continuous_primary_drying(
+            segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
         )
-        per_segment[seg.label or f"segment_{id(seg)}"] = float(
-            np.sqrt(np.mean((Tp_sim - seg.Tp_measured_k) ** 2))
-        )
+        for i, seg in enumerate(segments):
+            per_segment[seg.label or f"segment_{id(seg)}"] = float(
+                np.sqrt(np.mean((all_Tp_sim[i] - seg.Tp_measured_k) ** 2))
+            )
+    else:
+        # Legacy mode: independent segments
+        for seg in segments:
+            Tp_sim = simulate_cycle(
+                seg.t_s, seg.Ts_k, seg.Pc_pa, seg.tube,
+                seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=False
+            )
+            per_segment[seg.label or f"segment_{id(seg)}"] = float(
+                np.sqrt(np.mean((Tp_sim - seg.Tp_measured_k) ** 2))
+            )
         
     fitted["per_segment_rms_k"] = per_segment
     return fitted

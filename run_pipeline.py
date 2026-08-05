@@ -28,7 +28,7 @@ from ingest import (
 )
 
 from geometry import PCRTubeGeometry
-from pikal_model import DryingSegment, fit_parameters_joint
+from pikal_model import DryingSegment, fit_parameters_joint, simulate_cycle, simulate_continuous_primary_drying
 
 
 REQUIRED_MODEL_COLUMNS = [
@@ -513,6 +513,16 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--plot-residuals",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate residual plots showing measured vs simulated product temperature "
+            "and residuals for each segment. Saves plots as PNG files."
+        ),
+    )
+
     args = parser.parse_args()
 
     if not args.input_csv.exists():
@@ -586,7 +596,10 @@ def main():
     except Exception as exc:
         raise SystemExit(f"[error] Joint fit failed: {exc}")
 
-    # Build report.
+    # Extract fitted parameters for simulation
+    Kv, Rp0, A1, A2 = fitted["Kv"], fitted["Rp0"], fitted["A1"], fitted["A2"]
+    
+    # Build report with step-type aware per-segment data
     lines = [
         "=== Joint Pikal model fit ===",
         f"Input file: {args.input_csv.name}",
@@ -598,7 +611,24 @@ def main():
         f"Using transient mode (for multi-step ramps): {use_transient and not use_hybrid}",
         f"Using hybrid mode (shelf-setpt based Hold/Ramp detection): {use_hybrid}",
         f"Calibration points used: {len(calibration_points)}",
-        f"Segments used: {[s.label for s in segments]}",
+        "",
+        "Detected recipe setpoints (Hold vs Ramp):",
+    ]
+    
+    # Report detected step types with their characteristics
+    for seg in segments:
+        step_type = "Hold (steady-state)" if seg.is_hold_step else "Ramp (transient)"
+        # Get shelf temp range for this segment
+        Ts_min = seg.Ts_k.min() - 273.15  # Convert to Celsius
+        Ts_max = seg.Ts_k.max() - 273.15
+        Pc_mean = seg.Pc_pa.mean() / 100.0  # Convert to hPa/mbar
+        
+        lines.append(f"  {seg.label}: {step_type}")
+        lines.append(f"    Shelf temp: {Ts_min:.1f}C to {Ts_max:.1f}C")
+        lines.append(f"    Chamber pressure: {Pc_mean:.2f} mbar")
+        lines.append(f"    Duration: {seg.t_s[-1]:.0f}s ({seg.t_s[-1]/60:.1f} min)")
+    
+    lines.extend([
         "",
         "Fitted parameters:",
         f"  Kv  = {fitted['Kv']:.6f}",
@@ -608,12 +638,11 @@ def main():
         f"  Overall RMS error: {fitted['rms_error_k']:.6f} K",
         f"  Converged: {fitted['converged']}",
         "",
-        "Per-segment RMS (K) -- large outliers here suggest a mislabeled",
-        "phase/step or a segment that does not belong in the joint fit:",
-    ]
+        "Per-segment fit quality (RMS error in K):",
+    ])
 
     for label, rms in fitted.get("per_segment_rms_k", {}).items():
-        lines.append(f"  {label}: {rms:.6f}")
+        lines.append(f"  {label}: {rms:.6f} K")
 
     report = "\n".join(lines)
 
@@ -621,6 +650,72 @@ def main():
 
     args.report_out.write_text(report, encoding="utf-8")
     print(f"\nSaved report -> {args.report_out}")
+    
+    # Generate residual plots if requested
+    if args.plot_residuals:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+            
+            print("\nGenerating residual plots...")
+            
+            # Use continuous simulation across all segments when appropriate
+            if use_transient or use_hybrid:
+                all_Tp_sim = simulate_continuous_primary_drying(
+                    segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
+                )
+            else:
+                # Legacy mode: independent simulations
+                all_Tp_sim = []
+                for seg in segments:
+                    Tp_sim = simulate_cycle(
+                        seg.t_s, seg.Ts_k, seg.Pc_pa, seg.tube,
+                        seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=False
+                    )
+                    all_Tp_sim.append(Tp_sim)
+            
+            for i, seg in enumerate(segments):
+                Tp_sim = all_Tp_sim[i]
+                
+                # Calculate residuals
+                residuals = Tp_sim - seg.Tp_measured_k
+                
+                # Create figure with two subplots
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+                
+                # Top panel: Measured vs Simulated
+                ax1.plot(seg.t_s / 60, seg.Tp_measured_k - 273.15, 'b-', label='Measured', linewidth=1.5)
+                ax1.plot(seg.t_s / 60, Tp_sim - 273.15, 'r--', label='Simulated', linewidth=1.5)
+                ax1.set_ylabel('Temperature (°C)')
+                step_type = "Hold (steady-state)" if seg.is_hold_step else "Ramp (transient)"
+                continuity_note = " [continuous]" if (use_transient or use_hybrid) else ""
+                ax1.set_title(f'{seg.label} - Step Type: {step_type}{continuity_note}')
+                ax1.legend(loc='best')
+                ax1.grid(True, alpha=0.3)
+                
+                # Bottom panel: Residuals
+                ax2.plot(seg.t_s / 60, residuals, 'g-', linewidth=1)
+                ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
+                ax2.fill_between(seg.t_s / 60, residuals, 0, alpha=0.3, color='green')
+                ax2.set_xlabel('Time (min)')
+                ax2.set_ylabel('Residual (°C)')
+                ax2.set_title(f'Residuals (Simulated - Measured), RMS = {np.sqrt(np.mean(residuals**2)):.3f} K')
+                ax2.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                
+                # Save plot
+                plot_filename = f"residual_{seg.label.replace('=', '_').replace('cycle_', 'c').replace('step_', 's')}.png"
+                plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
+                print(f"  Saved: {plot_filename}")
+                plt.close(fig)
+            
+            print("Residual plots generated successfully.")
+        except ImportError:
+            print("[warn] matplotlib not installed; cannot generate residual plots. Install with: pip install matplotlib")
+        except Exception as exc:
+            print(f"[warn] Failed to generate residual plots: {exc}")
 
 
 if __name__ == "__main__":
