@@ -34,6 +34,7 @@ from core_pipeline import (
     choose_product_temperature_column,
     coerce_phase_code,
     parse_calib,
+    find_endpoint,
 )
 
 from pikal_model import fit_parameters_joint, simulate_cycle, simulate_continuous_primary_drying
@@ -157,12 +158,21 @@ def main():
     # Use calibrated geometry so --calib is actually applied.
     tube = CalibratedPCRTubeGeometry(calibration_points=calibration_points)
 
-    # Build primary-drying segments.
+    # Detect primary drying endpoint using Pirani/Capman convergence
+    endpoint_ts = find_endpoint(
+        df, 
+        abs_tol_pa=1.0, 
+        rel_tol=0.15, 
+        sustain_minutes=20.0
+    )
+
+    # Build primary-drying segments (truncated at endpoint)
     segments = build_segments(
         df=df,
         primary_phase_code=phase_code,
         tube=tube,
         fill_volume_m3=fill_volume_m3,
+        endpoint_timestamp=endpoint_ts,
         shelf_temp_std_threshold=0.1,  # Hold step if std(shelf_temp_k) < 0.1 K
         pressure_std_threshold=5.0,   # AND std(capman_pa) < 5.0 Pa
     )
@@ -216,6 +226,8 @@ def main():
         f"Using transient mode (for multi-step ramps): {use_transient and not use_hybrid}",
         f"Using hybrid mode (measured signal variance Hold/Ramp detection): {use_hybrid}",
         f"Calibration points used: {len(calibration_points)}",
+        "",
+        f"Primary drying endpoint detected at {endpoint_ts}. All data after this timestamp was excluded from the fit.",
         "",
         "Steady-state detection based on measured signal variance:",
         f"  Shelf temp threshold: std < 0.1 K",

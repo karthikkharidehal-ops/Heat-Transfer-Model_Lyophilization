@@ -31,6 +31,7 @@ from core_pipeline import (
     choose_product_temperature_column,
     coerce_phase_code,
     parse_calib,
+    find_endpoint,
 )
 
 from pikal_model import fit_parameters_joint, simulate_cycle, simulate_continuous_primary_drying
@@ -267,6 +268,16 @@ class PipelineGUI:
             # Use calibrated geometry
             tube = CalibratedPCRTubeGeometry(calibration_points=calibration_points)
             
+            # Detect primary drying endpoint using Pirani/Capman convergence
+            self._log("\n[2.5/6] Detecting primary drying endpoint (Pirani/Capman convergence)...")
+            endpoint_ts = find_endpoint(
+                df, 
+                abs_tol_pa=1.0, 
+                rel_tol=0.15, 
+                sustain_minutes=20.0
+            )
+            self._log(f"  Endpoint timestamp: {endpoint_ts}", 'info')
+            
             # Build segments using centralized physics with variance-based steady-state detection
             self._log("\n[3/6] Building drying segments...")
             segments = build_segments(
@@ -274,6 +285,7 @@ class PipelineGUI:
                 primary_phase_code=phase_code,
                 tube=tube,
                 fill_volume_m3=fill_volume_m3,
+                endpoint_timestamp=endpoint_ts,
                 shelf_temp_std_threshold=0.1,
                 pressure_std_threshold=5.0,
             )

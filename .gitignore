@@ -1,8 +1,26 @@
 
-=======
-```
+# Python
 __pycache__/
 *.pyc
-```
->>>>>>> cdf7a8592d2f89deb9a4840bc74e17ac35a86ae1
+*.pyo
+*.pyd
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Dependencies
+.venv/
+venv/
+
+# Data files
 batchreport.csv
