@@ -86,6 +86,42 @@ class PCRTubeGeometry:
         """
         return self.area_at_height(0.0)
 
+    def contact_area_m2(self, fill_height_m: float) -> float:
+        """
+        Calculate the total heat transfer contact area between the shelf/block
+        and the tube up to the fill height. This includes:
+        1. The lateral surface area of the frustum from h=0 to h=fill_height_m
+        2. The base area at the bottom
+        
+        Formula for lateral area of a frustum:
+            pi * (r1 + r2) * sqrt((r1 - r2)^2 + h^2)
+        
+        Parameters
+        ----------
+        fill_height_m : float
+            Height of the frozen product column from the tube bottom (m)
+            
+        Returns
+        -------
+        float
+            Total contact area in m² (lateral + base)
+        """
+        h = max(fill_height_m, 0.0)
+        if h <= 0.0:
+            return self.base_area_m2()
+        
+        r1 = self.bottom_radius_m  # radius at bottom (h=0)
+        r2 = self.radius_at_height(h)  # radius at fill height
+        
+        # Lateral surface area of frustum
+        slant_height = np.sqrt((r1 - r2) ** 2 + h ** 2)
+        lateral_area = np.pi * (r1 + r2) * slant_height
+        
+        # Add base area
+        base_area = self.base_area_m2()
+        
+        return float(lateral_area + base_area)
+
     def front_area_m2(self, fill_height_m: float, dried_thickness_m: float) -> float:
         """
         Cross-sectional area of the sublimation front.
