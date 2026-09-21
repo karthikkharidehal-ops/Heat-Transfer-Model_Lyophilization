@@ -1,4 +1,1 @@
-```
-__pycache__/
-*.pyc
-```
+Nothing needs to be added to .gitignore since the only change is adding a test Python file (`tests/test_pikal_physics.py`), which is source code and should not be ignored.

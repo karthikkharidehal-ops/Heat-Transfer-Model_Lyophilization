@@ -24,16 +24,336 @@ from ingest import (
     flag_primary_drying_end,
 )
 
-from core_pipeline import (
-    CalibratedPCRTubeGeometry,
-    build_segments,
-    choose_pressure_column,
-    choose_product_temperature_column,
-    coerce_phase_code,
-    parse_calib,
-)
+from geometry import PCRTubeGeometry
+from pikal_model import DryingSegment, fit_parameters_joint, simulate_cycle, simulate_continuous_primary_drying
 
-from pikal_model import fit_parameters_joint, simulate_cycle, simulate_continuous_primary_drying
+
+REQUIRED_MODEL_COLUMNS = [
+    "Phase",
+    "Cycle",
+    "Step",
+    "timestamp",
+    "shelf_temp_k",
+    "pressure_pa",
+    "product_temp_k",
+]
+
+
+class CalibratedPCRTubeGeometry(PCRTubeGeometry):
+    """
+    PCR tube geometry that uses empirical fill-height calibration if provided.
+    """
+
+    def __init__(self, calibration_points=None, **kwargs):
+        super().__init__(**kwargs)
+        self.calibration_points = calibration_points or []
+
+    def fill_height(self, fill_volume_m3):
+        if not self.calibration_points:
+            return super().fill_height(fill_volume_m3)
+
+        vols = np.array([vol for vol, _ in self.calibration_points], dtype=float)
+
+        if vols.size:
+            fill_vol_ul = fill_volume_m3 * 1e9
+            min_cal_ul = vols.min() * 1e9
+            max_cal_ul = vols.max() * 1e9
+
+            if fill_vol_ul < min_cal_ul or fill_vol_ul > max_cal_ul:
+                print(
+                    f"[warn] Fill volume {fill_vol_ul:.3f} uL is outside calibration range "
+                    f"{min_cal_ul:.3f}-{max_cal_ul:.3f} uL. "
+                    "Interpolation will clamp to the nearest calibration endpoint.",
+                    file=sys.stderr,
+                )
+
+        return self.fill_height_from_calibration(
+            fill_volume_m3,
+            self.calibration_points,
+        )
+
+
+def parse_calib(calib_str):
+    """
+    Parse calibration string like "6:1.8 12:2.9 20:4.1"
+    into SI pairs: [(6e-9 m3, 1.8e-3 m), ...]
+    """
+    if not calib_str.strip():
+        return []
+    
+    points = []
+    calib_args = calib_str.strip().split()
+
+    for arg in calib_args:
+        try:
+            vol_ul_str, height_mm_str = arg.split(":", maxsplit=1)
+            vol_ul = float(vol_ul_str)
+            height_mm = float(height_mm_str)
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid calibration value {arg!r}. "
+                "Expected format vol_ul:height_mm, e.g. 6:1.8"
+            ) from exc
+
+        if vol_ul <= 0:
+            raise ValueError(
+                f"Invalid calibration volume in {arg!r}. Volume must be positive."
+            )
+
+        if height_mm <= 0:
+            raise ValueError(
+                f"Invalid calibration height in {arg!r}. Height must be positive."
+            )
+
+        vol_m3 = vol_ul * 1e-9
+        height_m = height_mm * 1e-3
+        points.append((vol_m3, height_m))
+
+    if not points:
+        return []
+
+    # Sort by volume and average duplicate volume entries.
+    by_volume = {}
+
+    for vol_m3, height_m in points:
+        by_volume.setdefault(vol_m3, []).append(height_m)
+
+    cleaned = [
+        (vol_m3, float(np.mean(heights)))
+        for vol_m3, heights in sorted(by_volume.items())
+    ]
+
+    return cleaned
+
+
+def coerce_phase_code(df, raw_code):
+    """
+    Convert the user-supplied phase code into something comparable to df['Phase'].
+    """
+    raw = str(raw_code).strip()
+
+    if "Phase" not in df.columns:
+        raise ValueError("Missing required column: Phase")
+
+    phase_values = df["Phase"].dropna()
+
+    # Numeric Phase column.
+    if phase_values.dtype.kind in "if":
+        try:
+            numeric_raw = float(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"The Phase column is numeric, but --primary-phase-code "
+                f"{raw_code!r} is not numeric."
+            ) from exc
+
+        if numeric_raw.is_integer():
+            return int(numeric_raw)
+
+        return numeric_raw
+
+    # Object/string/category Phase column.
+    unique_phases = phase_values.unique()
+
+    # Exact string match.
+    if raw in unique_phases:
+        return raw
+
+    # Try integer conversion.
+    try:
+        as_int = int(raw)
+        if as_int in unique_phases:
+            return as_int
+    except ValueError:
+        pass
+
+    # Try float conversion.
+    try:
+        as_float = float(raw)
+        if as_float in unique_phases:
+            return as_float
+    except ValueError:
+        pass
+
+    # Case-insensitive string match.
+    raw_lower = raw.lower()
+
+    for value in unique_phases:
+        if isinstance(value, str) and value.strip().lower() == raw_lower:
+            return value
+
+    # Let the later filter fail with a helpful message if nothing matches.
+    return raw
+
+
+def choose_pressure_column(df):
+    """
+    Choose chamber pressure column.
+    """
+    candidates = [
+        "capman_pa",
+        "pirani_pa",
+        "vacuum_pa",
+        "vac_setpt_pa",
+    ]
+
+    for col in candidates:
+        if col in df.columns and df[col].notna().any():
+            df["pressure_pa"] = df[col]
+            return col
+
+    raise ValueError(
+        "No usable pressure column found. Expected at least one of: "
+        + ", ".join(candidates)
+    )
+
+
+def choose_product_temperature_column(df, use_min=False):
+    """
+    Choose product temperature column.
+    """
+    if use_min:
+        if "prod_min_k" in df.columns and df["prod_min_k"].notna().any():
+            df["product_temp_k"] = df["prod_min_k"]
+            return "prod_min_k"
+
+        tp_cols = [
+            col
+            for col in df.columns
+            if col.lower().startswith("tp") and col.lower().endswith("_k")
+        ]
+
+        if tp_cols:
+            df["product_temp_k"] = df[tp_cols].min(axis=1)
+            return f"min({', '.join(tp_cols)})"
+    else:
+        if "prod_avg_k" in df.columns and df["prod_avg_k"].notna().any():
+            df["product_temp_k"] = df["prod_avg_k"]
+            return "prod_avg_k"
+
+        tp_cols = [
+            col
+            for col in df.columns
+            if col.lower().startswith("tp") and col.lower().endswith("_k")
+        ]
+
+        if tp_cols:
+            df["product_temp_k"] = df[tp_cols].mean(axis=1)
+            return f"mean({', '.join(tp_cols)})"
+
+    raise ValueError(
+        "No usable product temperature column found. "
+        "Expected prod_avg_k/prod_min_k or TPxx_k columns."
+    )
+
+
+def build_segments(
+    df,
+    primary_phase_code,
+    tube,
+    fill_volume_m3,
+    min_segment_points=5,
+    hold_step_threshold=20,
+):
+    """
+    Build one DryingSegment per Cycle/Step combination inside Primary Drying.
+    """
+    missing = [col for col in REQUIRED_MODEL_COLUMNS if col not in df.columns]
+
+    if missing:
+        raise ValueError(
+            f"Missing required column(s) before segmentation: {missing}. "
+            f"Available columns: {sorted(df.columns)}"
+        )
+
+    primary_df = df[df["Phase"] == primary_phase_code].copy()
+
+    if primary_df.empty:
+        available_phases = sorted(
+            str(x) for x in df["Phase"].dropna().unique()
+        )
+
+        raise ValueError(
+            f"No rows found with Phase == {primary_phase_code!r}. "
+            f"Available Phase values: {available_phases}"
+        )
+
+    model_columns = [
+        "timestamp",
+        "shelf_temp_k",
+        "pressure_pa",
+        "product_temp_k",
+    ]
+
+    segments = []
+    skipped = []
+
+    for (cycle_id, step_id), group in primary_df.groupby(
+        ["Cycle", "Step"],
+        sort=True,
+    ):
+        group = group.sort_values("timestamp")
+        raw_row_count = len(group)
+
+        group = group.dropna(subset=model_columns)
+
+        if len(group) < min_segment_points:
+            skipped.append(
+                f"cycle={cycle_id}_step={step_id}: kept "
+                f"{len(group)}/{raw_row_count} rows "
+                f"(<{min_segment_points} valid rows)"
+            )
+            continue
+
+        # Detect if this is a hold step or ramp step based on shelf_setpt_k stability
+        is_hold_step = True  # Default to hold step
+        if "shelf_setpt_k" in group.columns:
+            shelf_setpt = group["shelf_setpt_k"].values
+            
+            # Find the maximum run length of consecutive identical values
+            max_consecutive = 1
+            current_consecutive = 1
+            for i in range(1, len(shelf_setpt)):
+                if np.isclose(shelf_setpt[i], shelf_setpt[i-1], rtol=1e-5):
+                    current_consecutive += 1
+                    max_consecutive = max(max_consecutive, current_consecutive)
+                else:
+                    current_consecutive = 1
+            
+            # If max consecutive identical values < threshold, it's a ramp step
+            is_hold_step = (max_consecutive >= hold_step_threshold)
+
+        t0 = group["timestamp"].iloc[0]
+
+        t_s = (
+            group["timestamp"] - t0
+        ).dt.total_seconds().to_numpy(dtype=float)
+
+        segments.append(
+            DryingSegment(
+                t_s=t_s,
+                Ts_k=group["shelf_temp_k"].to_numpy(dtype=float),
+                Pc_pa=group["pressure_pa"].to_numpy(dtype=float),
+                Tp_measured_k=group["product_temp_k"].to_numpy(dtype=float),
+                tube=tube,
+                fill_volume_m3=fill_volume_m3,
+                label=f"cycle={cycle_id}_step={step_id}",
+                is_hold_step=is_hold_step,
+            )
+        )
+
+    if skipped:
+        for item in skipped:
+            print(f"  {item}")
+
+    if not segments:
+        raise ValueError(
+            "No usable primary-drying segments were found after filtering. "
+            "Check the Phase code, Cycle/Step columns, timestamps, pressure "
+            "columns, and product-temperature columns."
+        )
+
+    return segments
 
 
 class PipelineGUI:
@@ -267,15 +587,14 @@ class PipelineGUI:
             # Use calibrated geometry
             tube = CalibratedPCRTubeGeometry(calibration_points=calibration_points)
             
-            # Build segments using centralized physics with variance-based steady-state detection
+            # Build segments
             self._log("\n[3/6] Building drying segments...")
             segments = build_segments(
                 df=df,
                 primary_phase_code=phase_code,
                 tube=tube,
                 fill_volume_m3=fill_volume_m3,
-                shelf_temp_std_threshold=0.1,
-                pressure_std_threshold=5.0,
+                hold_step_threshold=20,
             )
             self._log(f"  Built {len(segments)} segment(s): {[s.label for s in segments]}", 'success')
             
