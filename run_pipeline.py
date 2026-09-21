@@ -313,7 +313,8 @@ def build_segments(
     tube,
     fill_volume_m3,
     min_segment_points=5,
-    hold_step_threshold=20,
+    shelf_temp_std_threshold=0.1,
+    pressure_std_threshold=5.0,
 ):
     """
     Build one DryingSegment per Cycle/Step combination inside Primary Drying.
@@ -330,9 +331,11 @@ def build_segments(
         Fill volume in cubic meters
     min_segment_points : int, default 5
         Minimum number of valid rows per segment
-    hold_step_threshold : int, default 20
-        Number of consecutive data points with same shelf_setpt_k value
-        to classify as a hold step. Fewer than this indicates a ramp step.
+    shelf_temp_std_threshold : float, default 0.1 K
+        Maximum standard deviation of measured shelf_temp_k to classify as Hold step.
+    pressure_std_threshold : float, default 5.0 Pa
+        Maximum standard deviation of measured capman_pa to classify as Hold step.
+        A segment is classified as "Hold" (steady-state) ONLY if BOTH thresholds are met.
     """
     missing = [col for col in REQUIRED_MODEL_COLUMNS if col not in df.columns]
 
@@ -381,25 +384,26 @@ def build_segments(
             )
             continue
 
-        # Detect if this is a hold step or ramp step based on shelf_setpt_k stability
-        # If shelf_setpt_k has more than threshold consecutive identical values, it's a hold step
-        is_hold_step = True  # Default to hold step
-        if "shelf_setpt_k" in group.columns:
-            shelf_setpt = group["shelf_setpt_k"].values
-            
-            # Find the maximum run length of consecutive identical values
-            # (accounting for floating point tolerance)
-            max_consecutive = 1
-            current_consecutive = 1
-            for i in range(1, len(shelf_setpt)):
-                if np.isclose(shelf_setpt[i], shelf_setpt[i-1], rtol=1e-5):
-                    current_consecutive += 1
-                    max_consecutive = max(max_consecutive, current_consecutive)
-                else:
-                    current_consecutive = 1
-            
-            # If max consecutive identical values < threshold, it's a ramp step
-            is_hold_step = (max_consecutive >= hold_step_threshold)
+        # Detect if this is a hold step or ramp step based on MEASURED signal variance,
+        # NOT setpoint stability. Recipe setpoints do not prove physical steady-state.
+        # A segment is classified as "Hold" ONLY if:
+        #   - std(shelf_temp_k) < shelf_temp_std_threshold (e.g., 0.1 K)
+        #   - std(capman_pa) < pressure_std_threshold (e.g., 5.0 Pa)
+        # Otherwise, it is classified as "Ramp" (transient).
+        
+        shelf_temp_std = group["shelf_temp_k"].std()
+        
+        # Use capman_pa for pressure variance if available, otherwise fall back to pressure_pa
+        if "capman_pa" in group.columns and group["capman_pa"].notna().any():
+            pressure_std = group["capman_pa"].std()
+        else:
+            pressure_std = group["pressure_pa"].std()
+        
+        # Classify as Hold step only if BOTH signals are stable
+        is_hold_step = (
+            shelf_temp_std < shelf_temp_std_threshold and
+            pressure_std < pressure_std_threshold
+        )
 
         t0 = group["timestamp"].iloc[0]
 
@@ -417,6 +421,8 @@ def build_segments(
                 fill_volume_m3=fill_volume_m3,
                 label=f"cycle={cycle_id}_step={step_id}",
                 is_hold_step=is_hold_step,
+                _shelf_temp_std=shelf_temp_std,
+                _pressure_std=pressure_std,
             )
         )
 
@@ -506,10 +512,10 @@ def main():
         action="store_true",
         default=False,
         help=(
-            "Use hybrid modeling: detect Hold vs Ramp steps based on shelf setpoint stability. "
-            "If shelf_setpt_k has >=20 consecutive identical values, it's a Hold step (steady-state). "
-            "Otherwise it's a Ramp step (transient mode). This automatically applies the appropriate "
-            "physics based on actual process behavior rather than step numbering. Overrides --use-transient."
+            "Use hybrid modeling: detect Hold vs Ramp steps based on MEASURED signal variance. "
+            "A step is classified as Hold (steady-state) ONLY if std(shelf_temp_k) < 0.1 K AND "
+            "std(capman_pa) < 5.0 Pa. Otherwise it's a Ramp step (transient mode). This uses "
+            "actual physical measurements rather than PLC setpoints. Overrides --use-transient."
         ),
     )
 
@@ -559,7 +565,8 @@ def main():
         primary_phase_code=phase_code,
         tube=tube,
         fill_volume_m3=fill_volume_m3,
-        hold_step_threshold=20,  # Detect hold vs ramp based on 20 consecutive identical shelf_setpt values
+        shelf_temp_std_threshold=0.1,  # Hold step if std(shelf_temp_k) < 0.1 K
+        pressure_std_threshold=5.0,   # AND std(capman_pa) < 5.0 Pa
     )
 
     print(f"Built {len(segments)} segment(s): {[s.label for s in segments]}")
@@ -609,13 +616,17 @@ def main():
         f"Product temperature column used: {product_temp_col}",
         f"Using minimum probe temperature (ice-front approx): {args.use_min_temp}",
         f"Using transient mode (for multi-step ramps): {use_transient and not use_hybrid}",
-        f"Using hybrid mode (shelf-setpt based Hold/Ramp detection): {use_hybrid}",
+        f"Using hybrid mode (measured signal variance Hold/Ramp detection): {use_hybrid}",
         f"Calibration points used: {len(calibration_points)}",
         "",
-        "Detected recipe setpoints (Hold vs Ramp):",
+        "Steady-state detection based on measured signal variance:",
+        f"  Shelf temp threshold: std < 0.1 K",
+        f"  Pressure threshold: std < 5.0 Pa (capacitance manometer)",
+        "",
+        "Detected step classification (Hold vs Ramp):",
     ]
     
-    # Report detected step types with their characteristics
+    # Report detected step types with their characteristics AND measured variance proof
     for seg in segments:
         step_type = "Hold (steady-state)" if seg.is_hold_step else "Ramp (transient)"
         # Get shelf temp range for this segment
@@ -627,6 +638,11 @@ def main():
         lines.append(f"    Shelf temp: {Ts_min:.1f}C to {Ts_max:.1f}C")
         lines.append(f"    Chamber pressure: {Pc_mean:.2f} mbar")
         lines.append(f"    Duration: {seg.t_s[-1]:.0f}s ({seg.t_s[-1]/60:.1f} min)")
+        lines.append(f"    Measured steady-state variance proof:")
+        lines.append(f"      std(shelf_temp_k) = {seg._shelf_temp_std:.4f} K {'< 0.1 K ✓' if seg._shelf_temp_std < 0.1 else '>= 0.1 K ✗'}")
+        lines.append(f"      std(capman_pa) = {seg._pressure_std:.4f} Pa {'< 5.0 Pa ✓' if seg._pressure_std < 5.0 else '>= 5.0 Pa ✗'}")
+        classification_reason = "BOTH stable → HOLD" if seg.is_hold_step else "One or both signals unstable → RAMP"
+        lines.append(f"    Classification: {classification_reason}")
     
     lines.extend([
         "",
@@ -690,7 +706,8 @@ def main():
                 ax1.set_ylabel('Temperature (°C)')
                 step_type = "Hold (steady-state)" if seg.is_hold_step else "Ramp (transient)"
                 continuity_note = " [continuous]" if (use_transient or use_hybrid) else ""
-                ax1.set_title(f'{seg.label} - Step Type: {step_type}{continuity_note}')
+                variance_proof = f"σ(Ts)={seg._shelf_temp_std:.3f}K, σ(P)={seg._pressure_std:.2f}Pa"
+                ax1.set_title(f'{seg.label} - Step Type: {step_type}{continuity_note}\n{variance_proof}')
                 ax1.legend(loc='best')
                 ax1.grid(True, alpha=0.3)
                 
