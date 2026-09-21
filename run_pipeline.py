@@ -256,6 +256,9 @@ def main():
     
     lines.extend([
         "",
+        f"Pirani and Capacitance Manometer (CM) merge time: {endpoint_ts}",
+        "(This marks the primary drying endpoint when water vapor sublimation ceased)",
+        "",
         "Fitted parameters:",
         f"  Kv  = {fitted['Kv']:.6f}",
         f"  Rp0 = {fitted['Rp0']:.6f}",
