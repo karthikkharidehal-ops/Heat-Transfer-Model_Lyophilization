@@ -1,4 +1,4 @@
-```
+
 # Python
 __pycache__/
 *.pyc
@@ -21,4 +21,6 @@ __pycache__/
 # Dependencies
 .venv/
 venv/
-```
+
+# Data files
+batchreport.csv
