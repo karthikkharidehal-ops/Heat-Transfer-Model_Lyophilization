@@ -119,6 +119,16 @@ def main():
     )
 
     parser.add_argument(
+        "--contact-efficiency",
+        type=float,
+        default=0.22,
+        help=(
+            "Contact efficiency factor for PCR tube thermal contact with aluminum block/shelf "
+            "(default 0.22 per Graberg thesis)"
+        ),
+    )
+
+    parser.add_argument(
         "--plot-residuals",
         action="store_true",
         default=False,
@@ -156,7 +166,10 @@ def main():
     fill_volume_m3 = args.fill_volume_ul * 1e-9
 
     # Use calibrated geometry so --calib is actually applied.
-    tube = CalibratedPCRTubeGeometry(calibration_points=calibration_points)
+    tube = CalibratedPCRTubeGeometry(
+        calibration_points=calibration_points,
+        contact_efficiency=args.contact_efficiency
+    )
 
     # Detect primary drying endpoint using Pirani/Capman convergence
     endpoint_ts = find_endpoint(

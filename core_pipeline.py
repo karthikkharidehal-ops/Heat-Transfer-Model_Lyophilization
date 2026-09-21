@@ -42,8 +42,8 @@ class CalibratedPCRTubeGeometry(PCRTubeGeometry):
     --calib are actually used in the model.
     """
 
-    def __init__(self, calibration_points=None, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, calibration_points=None, contact_efficiency=0.22, **kwargs):
+        super().__init__(contact_efficiency=contact_efficiency, **kwargs)
         self.calibration_points = calibration_points or []
 
     def fill_height(self, fill_volume_m3):
@@ -496,19 +496,9 @@ def build_segments(
             f"Available Phase values: {available_phases}"
         )
 
-    # Filter out post-endpoint data BEFORE segmentation
-    if endpoint_timestamp is not None:
-        pre_endpoint_mask = primary_df["timestamp"] <= endpoint_timestamp
-        post_endpoint_count = (~pre_endpoint_mask).sum()
-        if post_endpoint_count > 0:
-            print(f"[info] Excluding {post_endpoint_count} post-endpoint rows from segmentation.")
-        primary_df = primary_df[pre_endpoint_mask].copy()
-        
-        if primary_df.empty:
-            raise ValueError(
-                f"All primary drying data is after the endpoint timestamp ({endpoint_timestamp}). "
-                "Check your endpoint detection or Phase code."
-            )
+    # Note: We do NOT filter out post-endpoint data here anymore.
+    # Instead, endpoint truncation is handled per-segment below to enable diagnostics.
+    # The endpoint_timestamp is used to slice each segment individually.
 
     model_columns = [
         "timestamp",
@@ -528,7 +518,8 @@ def build_segments(
         raw_row_count = len(group)
 
         group = group.dropna(subset=model_columns)
-
+        rows_after_dropna = len(group)
+        
         if len(group) < min_segment_points:
             skipped.append(
                 f"cycle={cycle_id}_step={step_id}: kept "
@@ -537,7 +528,7 @@ def build_segments(
             )
             continue
 
-        # Check if entire segment is post-endpoint (shouldn't happen after filtering, but safety check)
+        # Check if entire segment is post-endpoint
         if endpoint_timestamp is not None and group["timestamp"].iloc[0] > endpoint_timestamp:
             skipped.append(
                 f"cycle={cycle_id}_step={step_id}: Post-endpoint (starts at {group['timestamp'].iloc[0]})"
@@ -572,8 +563,11 @@ def build_segments(
         ).dt.total_seconds().to_numpy(dtype=float)
 
         # Slice arrays to terminate exactly at endpoint if this segment contains it
+        rows_dropped_endpoint = 0
         if endpoint_timestamp is not None:
             end_mask = group["timestamp"] <= endpoint_timestamp
+            rows_kept_before_truncation = end_mask.sum()
+            rows_dropped_endpoint = (~end_mask).sum()
             group = group[end_mask].copy()
             
             # Recalculate t_s and arrays after slicing
@@ -588,6 +582,11 @@ def build_segments(
             t_s = (
                 group["timestamp"] - t0
             ).dt.total_seconds().to_numpy(dtype=float)
+
+        # Diagnostic print for endpoint truncation
+        if rows_dropped_endpoint > 0:
+            rows_kept = len(group)
+            print(f"[DIAG] cycle={cycle_id}_step={step_id}: kept {rows_kept}/{rows_kept_before_truncation} rows (dropped {rows_dropped_endpoint} rows due to endpoint truncation)")
 
         segments.append(
             DryingSegment(
