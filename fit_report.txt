@@ -1,0 +1,62 @@
+=== Joint Pikal model fit ===
+Input file: batchreport.csv
+Primary phase code used: 6
+Fill volume: 12.0 uL
+Pressure column used: capman_pa
+Product temperature column used: prod_avg_k
+Using minimum probe temperature (ice-front approx): False
+Using transient mode (for multi-step ramps): False
+Using hybrid mode (shelf-setpt based Hold/Ramp detection): True
+Calibration points used: 3
+
+Detected recipe setpoints (Hold vs Ramp):
+  cycle=1_step=2: Ramp (transient)
+    Shelf temp: -49.3C to -48.8C
+    Chamber pressure: 0.20 mbar
+    Duration: 600s (10.0 min)
+  cycle=1_step=3: Ramp (transient)
+    Shelf temp: -49.3C to -34.0C
+    Chamber pressure: 0.01 mbar
+    Duration: 60018s (1000.3 min)
+  cycle=1_step=4: Hold (steady-state)
+    Shelf temp: -34.3C to -33.9C
+    Chamber pressure: 0.00 mbar
+    Duration: 3602s (60.0 min)
+  cycle=1_step=5: Ramp (transient)
+    Shelf temp: -34.1C to -29.1C
+    Chamber pressure: 0.00 mbar
+    Duration: 7201s (120.0 min)
+  cycle=1_step=6: Hold (steady-state)
+    Shelf temp: -29.3C to -28.9C
+    Chamber pressure: 0.00 mbar
+    Duration: 7202s (120.0 min)
+  cycle=1_step=7: Ramp (transient)
+    Shelf temp: -29.2C to 0.3C
+    Chamber pressure: 0.00 mbar
+    Duration: 7201s (120.0 min)
+  cycle=1_step=8: Hold (steady-state)
+    Shelf temp: 0.3C to 0.9C
+    Chamber pressure: 0.00 mbar
+    Duration: 3601s (60.0 min)
+  cycle=1_step=9: Ramp (transient)
+    Shelf temp: 0.7C to 29.9C
+    Chamber pressure: 0.01 mbar
+    Duration: 7202s (120.0 min)
+
+Fitted parameters:
+  Kv  = 10600.842739
+  Rp0 = 9653.763005
+  A1  = 1207415.334088
+  A2  = 345.122877
+  Overall RMS error: 7.167905 K
+  Converged: True
+
+Per-segment fit quality (RMS error in K):
+  cycle=1_step=2: 2.767253 K
+  cycle=1_step=3: 7.493793 K
+  cycle=1_step=4: 9.553864 K
+  cycle=1_step=5: 8.533624 K
+  cycle=1_step=6: 8.225918 K
+  cycle=1_step=7: 4.361891 K
+  cycle=1_step=8: 3.786839 K
+  cycle=1_step=9: 3.001118 K
