@@ -286,6 +286,18 @@ def main():
     for label, rms in fitted.get("per_segment_rms_k", {}).items():
         lines.append(f"  {label}: {rms:.6f} K")
 
+    # Add state continuity diagnostics if using continuous simulation
+    if use_transient or use_hybrid:
+        lines.extend([
+            "",
+            "[STATE-CONTINUITY] Diagnostics (from continuous simulation):",
+        ])
+        # Re-run simulation to capture state continuity prints
+        print("\n[CLI] State continuity diagnostics for fit:")
+        simulate_continuous_primary_drying(
+            segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
+        )
+
     report = "\n".join(lines)
 
     print("\n" + report)

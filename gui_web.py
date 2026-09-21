@@ -491,6 +491,19 @@ def run_pipeline():
         for label, rms in fitted.get("per_segment_rms_k", {}).items():
             lines.append(f"  {label}: {rms:.6f} K")
         
+        # Add state continuity diagnostics if using continuous simulation
+        if use_transient_final or use_hybrid:
+            lines.extend([
+                "",
+                "[STATE-CONTINUITY] Diagnostics (from continuous simulation):",
+            ])
+            # Re-run simulation to capture state continuity prints
+            print("\n[GUI] State continuity diagnostics for fit:")
+            simulate_continuous_primary_drying(
+                segments, fitted['Kv'], fitted['Rp0'], fitted['A1'], fitted['A2'],
+                use_hybrid=use_hybrid
+            )
+        
         report = "\n".join(lines)
         report_path = Path(temp_dir) / report_out
         report_path.write_text(report, encoding="utf-8")
