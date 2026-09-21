@@ -9,7 +9,7 @@ import sys
 import threading
 from pathlib import Path
 from tkinter import (
-    Tk, Frame, Label, Entry, Button, Checkbutton, IntVar, StringVar, 
+    Tk, Frame, Label, LabelFrame, Entry, Button, Checkbutton, IntVar, StringVar, 
     Text, Scrollbar, END, filedialog, messagebox, ttk
 )
 from tkinter.scrolledtext import ScrolledText
