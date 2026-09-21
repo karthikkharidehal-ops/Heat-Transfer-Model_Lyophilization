@@ -71,16 +71,27 @@ class CalibratedPCRTubeGeometry(PCRTubeGeometry):
         )
 
 
-def parse_calib(calib_args):
+def parse_calib(calib_input):
     """
-    Parse --calib arguments like:
-
-        6:1.8 12:2.9 20:4.1
-
-    into SI pairs:
-
-        [(6e-9 m3, 1.8e-3 m), ...]
+    Parse calibration input. Accepts either a list of strings (from CLI)
+    or a single string (from GUI).
+    
+    Format: "vol_ul:height_mm" (e.g., "6:1.8 12:2.9 20:4.1")
     """
+    if not calib_input:
+        return []
+    
+    # Handle both string input (GUI) and list input (CLI)
+    if isinstance(calib_input, str):
+        calib_args = calib_input.strip().split()
+    elif isinstance(calib_input, list):
+        calib_args = calib_input
+    else:
+        raise ValueError(f"Invalid calibration input type: {type(calib_input)}")
+    
+    if not calib_args:
+        return []
+
     points = []
 
     for arg in calib_args:
@@ -90,18 +101,18 @@ def parse_calib(calib_args):
             height_mm = float(height_mm_str)
         except Exception as exc:
             raise ValueError(
-                f"Invalid --calib value {arg!r}. "
+                f"Invalid calibration value {arg!r}. "
                 "Expected format vol_ul:height_mm, e.g. 6:1.8"
             ) from exc
 
         if vol_ul <= 0:
             raise ValueError(
-                f"Invalid --calib volume in {arg!r}. Volume must be positive."
+                f"Invalid calibration volume in {arg!r}. Volume must be positive."
             )
 
         if height_mm <= 0:
             raise ValueError(
-                f"Invalid --calib height in {arg!r}. Height must be positive."
+                f"Invalid calibration height in {arg!r}. Height must be positive."
             )
 
         vol_m3 = vol_ul * 1e-9
@@ -123,7 +134,6 @@ def parse_calib(calib_args):
     ]
 
     return cleaned
-
 
 def coerce_phase_code(df, raw_code):
     """
