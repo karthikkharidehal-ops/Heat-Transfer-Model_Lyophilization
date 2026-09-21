@@ -1,2 +1,7 @@
-Nothing needs to be added to .gitignore since the only change is adding a test Python file (`tests/test_pikal_physics.py`), which is source code and should not be ignored.
-batchreport.csv
+
+=======
+```
+__pycache__/
+*.pyc
+```
+>>>>>>> cdf7a8592d2f89deb9a4840bc74e17ac35a86ae1
