@@ -27,6 +27,7 @@ class PCRTubeGeometry:
     top_radius_m: float = DEFAULT_TOP_RADIUS_M
     bottom_radius_m: float = DEFAULT_BOTTOM_RADIUS_M
     tube_height_m: float = DEFAULT_TUBE_HEIGHT_M
+    contact_efficiency: float = 0.22  # Graberg thesis: ~22% effective contact area for PCR tubes in well plates
 
     def radius_at_height(self, h_from_bottom_m: float) -> float:
         """Linear taper: radius at height h above the tube's bottom point."""
@@ -93,6 +94,9 @@ class PCRTubeGeometry:
         1. The lateral surface area of the frustum from h=0 to h=fill_height_m
         2. The base area at the bottom
         
+        The result is scaled by self.contact_efficiency to account for non-conformal
+        thermal contact between the PCR tube and aluminum block/shelf (Graberg thesis).
+        
         Formula for lateral area of a frustum:
             pi * (r1 + r2) * sqrt((r1 - r2)^2 + h^2)
         
@@ -104,11 +108,11 @@ class PCRTubeGeometry:
         Returns
         -------
         float
-            Total contact area in m² (lateral + base)
+            Total contact area in m² (lateral + base), scaled by contact_efficiency
         """
         h = max(fill_height_m, 0.0)
         if h <= 0.0:
-            return self.base_area_m2()
+            return self.base_area_m2() * self.contact_efficiency
         
         r1 = self.bottom_radius_m  # radius at bottom (h=0)
         r2 = self.radius_at_height(h)  # radius at fill height
@@ -120,7 +124,8 @@ class PCRTubeGeometry:
         # Add base area
         base_area = self.base_area_m2()
         
-        return float(lateral_area + base_area)
+        # Apply contact efficiency factor (Graberg thesis: ~22% effective contact)
+        return float((lateral_area + base_area) * self.contact_efficiency)
 
     def front_area_m2(self, fill_height_m: float, dried_thickness_m: float) -> float:
         """
