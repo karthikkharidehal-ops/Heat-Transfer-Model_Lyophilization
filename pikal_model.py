@@ -297,6 +297,9 @@ def simulate_continuous_primary_drying(
         n = len(seg.t_s)
         Tp_sim = np.zeros(n)
         
+        # Debug print for state continuity verification
+        print(f"[STATE-CONTINUITY] Segment {seg_idx} ({seg.label}): L_start = {L:.6f} m, ice_mass = {ice_mass:.9f} kg")
+        
         # Determine physics mode for this segment
         seg_use_transient = True  # Default to transient for continuity
         if use_hybrid:
