@@ -19,7 +19,7 @@ def p_ice(Tp_k: float) -> float:
 
 def solve_Tp(
     Ts_k: float, Pc_pa: float, Rp: float, Rs: float,
-    Av_base: float, A_front: float, Kv: float,
+    contact_area: float, A_front: float, Kv: float,
     Tp_prev_k: float | None = None, dt: float | None = None,
     ice_mass: float | None = None, cp_ice: float = 2090.0
 ) -> tuple[float, float]:
@@ -36,8 +36,8 @@ def solve_Tp(
         Product resistance (m²·s·Pa/kg)
     Rs : float
         Stopper/chamber resistance (m²·s·Pa/kg)
-    Av_base : float
-        Vial base area (m²)
+    contact_area : float
+        Heat transfer contact area (m²) - lateral surface area + base
     A_front : float
         Sublimation front area (m²)
     Kv : float
@@ -74,7 +74,7 @@ def solve_Tp(
         flux = (p_ice(Tp_k) - Pc_pa) / (Rp + Rs) if (Rp + Rs) > 0 else 0.0
         flux = max(flux, 0.0)
         dmdt_total = flux * A_front
-        q_supplied = Kv * (Ts_k - Tp_k) * Av_base
+        q_supplied = Kv * (Ts_k - Tp_k) * contact_area
         q_consumed = dmdt_total * DH_S
         
         # Add transient heat accumulation term if parameters provided
@@ -135,8 +135,8 @@ def simulate_cycle(
     """
     n = len(t_s)
     Tp_sim = np.zeros(n)
-    Av_base = tube.base_area_m2()
     fill_height = tube.fill_height(fill_volume_m3)
+    contact_area = tube.contact_area_m2(fill_height)
     L = 0.0  # dried-layer thickness from the top, meters
     
     # Initialize for transient mode
@@ -157,7 +157,7 @@ def simulate_cycle(
             dt = float(t_s[i] - t_s[i - 1])
             flux, Tp_k = solve_Tp(
                 float(Ts_k[i]), float(Pc_pa[i]), float(Rp), float(Rs),
-                float(Av_base), float(A_front), float(Kv),
+                float(contact_area), float(A_front), float(Kv),
                 Tp_prev_k=float(Tp_prev), dt=dt, ice_mass=float(ice_mass)
             )
             # Update ice mass based on sublimation
@@ -168,7 +168,7 @@ def simulate_cycle(
         else:
             flux, Tp_k = solve_Tp(
                 float(Ts_k[i]), float(Pc_pa[i]), float(Rp), float(Rs),
-                float(Av_base), float(A_front), float(Kv)
+                float(contact_area), float(A_front), float(Kv)
             )
         
         Tp_sim[i] = Tp_k
@@ -280,7 +280,7 @@ def simulate_continuous_primary_drying(
     tube = segments[0].tube
     fill_volume_m3 = segments[0].fill_volume_m3
     fill_height = tube.fill_height(fill_volume_m3)
-    Av_base = tube.base_area_m2()
+    contact_area = tube.contact_area_m2(fill_height)
     
     # Initialize ice mass (full ice volume at start of primary drying)
     initial_ice_volume = fill_volume_m3
@@ -314,7 +314,7 @@ def simulate_continuous_primary_drying(
                 dt = float(seg.t_s[i] - seg.t_s[i - 1])
                 flux, Tp_k = solve_Tp(
                     float(seg.Ts_k[i]), float(seg.Pc_pa[i]), float(Rp), float(Rs),
-                    float(Av_base), float(A_front), float(Kv),
+                    float(contact_area), float(A_front), float(Kv),
                     Tp_prev_k=float(Tp_prev), dt=dt, ice_mass=float(ice_mass)
                 )
                 # Update ice mass based on sublimation
@@ -327,7 +327,7 @@ def simulate_continuous_primary_drying(
                 # Still uses current L and ice_mass from previous segments
                 flux, Tp_k = solve_Tp(
                     float(seg.Ts_k[i]), float(seg.Pc_pa[i]), float(Rp), float(Rs),
-                    float(Av_base), float(A_front), float(Kv)
+                    float(contact_area), float(A_front), float(Kv)
                 )
                 # For steady-state, we still track ice mass but don't use accumulation term
                 dmdt_total = flux * A_front

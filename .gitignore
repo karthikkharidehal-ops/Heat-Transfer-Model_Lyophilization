@@ -1,2 +1,10 @@
-Nothing should be ignored based on the provided file changes. The only modified file is 'gui_web.py', which appears to be a source code file and should not be ignored.
-batchreport.csv
+```
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Tests cache
+tests/__pycache__/
+```
