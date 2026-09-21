@@ -240,6 +240,8 @@ class DryingSegment:
     fill_volume_m3: float
     label: str = ""
     is_hold_step: bool = True  # Default to hold step (steady-state)
+    _shelf_temp_std: float = 0.0  # Measured shelf temperature std dev (K) for reporting
+    _pressure_std: float = 0.0  # Measured pressure std dev (Pa) for reporting
 
 
 def simulate_continuous_primary_drying(

@@ -1,10 +1,20 @@
 ```
-# Python compiled files
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Tests cache
-tests/__pycache__/
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Dependencies
+.venv/
+venv/
 ```
