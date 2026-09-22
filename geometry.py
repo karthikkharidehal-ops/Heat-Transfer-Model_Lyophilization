@@ -127,6 +127,11 @@ class PCRTubeGeometry:
         # Apply contact efficiency factor (Graberg thesis: ~22% effective contact)
         return float((lateral_area + base_area) * self.contact_efficiency)
 
+    @property
+    def outer_radius(self) -> float:
+        """Return the top (outer) radius of the PCR tube."""
+        return self.top_radius_m
+
     def front_area_m2(self, fill_height_m: float, dried_thickness_m: float) -> float:
         """
         Cross-sectional area of the sublimation front.
