@@ -225,7 +225,9 @@ def main():
         fitted = fit_parameters_joint(
             segments, 
             use_transient=use_transient,
-            use_hybrid=use_hybrid
+            use_hybrid=use_hybrid,
+            endpoint_time_s=endpoint_time_from_start,
+            mass_balance_weight=1.0
         )
     except Exception as exc:
         raise SystemExit(f"[error] Joint fit failed: {exc}")
@@ -324,6 +326,11 @@ def main():
     ])
     
     lines.extend([
+        "",
+        "=== Mass-Balance Constraint ===",
+        f"Detected endpoint time: {endpoint_time_from_start:.1f} s" if endpoint_time_from_start is not None else "Detected endpoint time: N/A",
+        f"Simulated endpoint time: {fitted.get('simulated_endpoint_time_s', 'N/A'):.1f} s" if fitted.get('simulated_endpoint_time_s') is not None else "Simulated endpoint time: N/A",
+        f"Mass-balance residual: {fitted.get('mass_balance_residual', 'N/A'):.6f}" if fitted.get('mass_balance_residual') is not None else "Mass-balance residual: N/A (endpoint not provided)",
         "",
         "Fitted parameters:",
         f"  Kv  = {fitted['Kv']:.6f}",

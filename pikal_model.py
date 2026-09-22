@@ -248,7 +248,7 @@ def simulate_continuous_primary_drying(
     segments: list[DryingSegment],
     Kv: float, Rp0: float, A1: float, A2: float, Rs: float = 0.0,
     use_hybrid: bool = False
-) -> list[np.ndarray]:
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """Simulate primary drying continuously across multiple segments (Steps 2-9).
     
     This maintains continuity of:
@@ -275,6 +275,10 @@ def simulate_continuous_primary_drying(
     -------
     Tp_simulations : list[np.ndarray]
         List of simulated product temperature arrays, one per segment
+    t_arrays : list[np.ndarray]
+        List of time arrays (seconds from segment start), one per segment
+    ice_mass_trajectories : list[np.ndarray]
+        List of ice mass trajectories (kg), one per segment
     """
     # Initialize state variables at the start of primary drying
     # These will be carried forward across all segments
@@ -286,16 +290,20 @@ def simulate_continuous_primary_drying(
     
     # Initialize ice mass (full ice volume at start of primary drying)
     initial_ice_volume = fill_volume_m3
-    ice_mass = RHO_ICE * initial_ice_volume
+    initial_ice_mass = RHO_ICE * initial_ice_volume
+    ice_mass = initial_ice_mass
     
     # Initial product temperature guess
     Tp_prev = segments[0].Ts_k[0] - 5.0  # Start ~5K below shelf temp
     
     all_Tp_sim = []
+    all_t_arrays = []
+    all_ice_mass_trajectories = []
     
     for seg_idx, seg in enumerate(segments):
         n = len(seg.t_s)
         Tp_sim = np.zeros(n)
+        ice_mass_trajectory = np.zeros(n)  # Track ice mass over this segment
         
         # Debug print for state continuity verification
         print(f"[STATE-CONTINUITY] Segment {seg_idx} ({seg.label}): L_start = {L:.6f} m, ice_mass = {ice_mass:.9f} kg")
@@ -313,6 +321,9 @@ def simulate_continuous_primary_drying(
             
             # Calculate front area based on current front position
             A_front = tube.front_area_m2(fill_height, L)
+            
+            # Record ice mass at this timestep
+            ice_mass_trajectory[i] = ice_mass
             
             if seg_use_transient and i > 0:
                 # Transient mode: include heat accumulation term
@@ -351,15 +362,19 @@ def simulate_continuous_primary_drying(
                 L = min(L, fill_height)  # Front can't pass tube bottom
         
         all_Tp_sim.append(Tp_sim)
+        all_t_arrays.append(seg.t_s.copy())
+        all_ice_mass_trajectories.append(ice_mass_trajectory)
     
-    return all_Tp_sim
+    return all_Tp_sim, all_t_arrays, all_ice_mass_trajectories
 
 
 def fit_parameters_joint(
     segments: list[DryingSegment], 
     initial_guess: dict | None = None,
     use_transient: bool = False,
-    use_hybrid: bool = False
+    use_hybrid: bool = False,
+    endpoint_time_s: float | None = None,
+    mass_balance_weight: float = 1.0
 ) -> dict:
     """Fit ONE shared {Kv, Rp0, A1, A2} across multiple segments.
     
@@ -381,18 +396,122 @@ def fit_parameters_joint(
         If True, apply quasi-steady state for Hold steps (detected by shelf_setpt stability)
         and transient mode for Ramp steps, while maintaining state continuity across all steps.
         This overrides use_transient when enabled.
+    endpoint_time_s : float, optional
+        Detected primary-drying endpoint time in seconds from start of primary drying.
+        If provided, a mass-balance constraint is added to enforce that simulated ice
+        depletes at this detected endpoint.
+    mass_balance_weight : float, default 1.0
+        Weight for the mass-balance residual term in the joint fit.
+        
+    Returns
+    -------
+    fitted : dict
+        Dictionary containing fitted parameters and diagnostics:
+        - Kv, Rp0, A1, A2: Fitted model parameters
+        - rms_error_k: Overall RMS error in K
+        - converged: Boolean indicating convergence
+        - per_segment_rms_k: Per-segment RMS errors
+        - simulated_endpoint_time_s: Simulated endpoint time (if endpoint_time_s provided)
+        - mass_balance_residual: Mass-balance residual value (if endpoint_time_s provided)
     """
     guess = initial_guess or dict(Kv=15.0, Rp0=2e4, A1=1e6, A2=100.0)
     x0 = np.array([guess["Kv"], guess["Rp0"], guess["A1"], guess["A2"]], dtype=float)
+    
+    # Store endpoint_time_s in outer scope for use in resid function
+    _endpoint_time_s = endpoint_time_s
+    _mass_balance_weight = mass_balance_weight
+
+    def compute_simulated_endpoint_time(ice_mass_trajectories: list[np.ndarray], 
+                                         t_arrays: list[np.ndarray],
+                                         initial_ice_mass: float) -> float:
+        """Compute simulated endpoint time from ice mass trajectories.
+        
+        Endpoint is defined as first time ice_mass <= 1% of initial ice mass.
+        If ice never depletes within simulated window, extrapolate using mean
+        depletion rate of final segment.
+        
+        Parameters
+        ----------
+        ice_mass_trajectories : list[np.ndarray]
+            Ice mass trajectory for each segment
+        t_arrays : list[np.ndarray]
+            Time arrays for each segment (seconds from segment start)
+        initial_ice_mass : float
+            Initial ice mass at start of primary drying
+            
+        Returns
+        -------
+        simulated_endpoint_time_s : float
+            Simulated endpoint time in seconds from start of primary drying
+        """
+        # Concatenate all segments to get continuous timeline
+        cumulative_time = 0.0
+        all_times = []
+        all_ice_masses = []
+        
+        for seg_idx, (t_arr, ice_traj) in enumerate(zip(t_arrays, ice_mass_trajectories)):
+            for i in range(len(t_arr)):
+                all_times.append(cumulative_time + t_arr[i])
+                all_ice_masses.append(ice_traj[i])
+            if len(t_arr) > 0:
+                cumulative_time += t_arr[-1]
+        
+        threshold = 0.01 * initial_ice_mass
+        
+        # Find first time ice_mass <= 1% of initial
+        for i, im in enumerate(all_ice_masses):
+            if im <= threshold:
+                return all_times[i]
+        
+        # Ice never depleted within simulated window - extrapolate
+        # Use mean depletion rate of final segment
+        if len(all_ice_masses) >= 2:
+            final_im = all_ice_masses[-1]
+            final_t = all_times[-1]
+            
+            # Get depletion rate from last few points of final segment
+            n_final = min(5, len(all_ice_masses))
+            if n_final >= 2:
+                im_final_segment = all_ice_masses[-n_final:]
+                t_final_segment = all_times[-n_final:]
+                
+                # Mean depletion rate (kg/s)
+                dt = t_final_segment[-1] - t_final_segment[0]
+                if dt > 0:
+                    depletion_rate = (im_final_segment[0] - im_final_segment[-1]) / dt
+                    
+                    if depletion_rate > 0:
+                        # Extrapolate time to reach threshold
+                        remaining_ice = final_im - threshold
+                        time_to_deplete = remaining_ice / depletion_rate
+                        return final_t + time_to_deplete
+        
+        # Fallback: return end of simulated window
+        return all_times[-1] if all_times else 0.0
 
     def resid(x: np.ndarray) -> np.ndarray:
         Kv, Rp0, A1, A2 = x
         # Use continuous simulation across all segments
         if use_transient or use_hybrid:
-            all_Tp_sim = simulate_continuous_primary_drying(
+            all_Tp_sim, all_t_arrays, all_ice_mass_trajectories = simulate_continuous_primary_drying(
                 segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
             )
             out = [all_Tp_sim[i] - segments[i].Tp_measured_k for i in range(len(segments))]
+            
+            # Add mass-balance residual if endpoint_time_s is provided
+            if _endpoint_time_s is not None and _endpoint_time_s > 0:
+                # Calculate initial ice mass from first segment
+                tube = segments[0].tube
+                fill_volume_m3 = segments[0].fill_volume_m3
+                initial_ice_mass = RHO_ICE * fill_volume_m3
+                
+                simulated_endpoint = compute_simulated_endpoint_time(
+                    all_ice_mass_trajectories, all_t_arrays, initial_ice_mass
+                )
+                
+                # Normalized mass-balance residual
+                mass_residual = _mass_balance_weight * (simulated_endpoint - _endpoint_time_s) / _endpoint_time_s
+                out.append(np.array([mass_residual]))
         else:
             # Legacy mode: independent segments (no state continuity)
             out = []
@@ -415,17 +534,29 @@ def fit_parameters_joint(
     fitted["rms_error_k"] = float(np.sqrt(np.mean(fun_vals ** 2)))
     fitted["converged"] = bool(success)
 
-    # Calculate per-segment RMS errors using continuous simulation
+    # Calculate per-segment RMS errors and mass-balance diagnostics using continuous simulation
     per_segment = {}
     Kv, Rp0, A1, A2 = x_vals
     if use_transient or use_hybrid:
-        all_Tp_sim = simulate_continuous_primary_drying(
+        all_Tp_sim, all_t_arrays, all_ice_mass_trajectories = simulate_continuous_primary_drying(
             segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
         )
         for i, seg in enumerate(segments):
             per_segment[seg.label or f"segment_{id(seg)}"] = float(
                 np.sqrt(np.mean((all_Tp_sim[i] - seg.Tp_measured_k) ** 2))
             )
+        
+        # Compute mass-balance diagnostics if endpoint was provided
+        if endpoint_time_s is not None and endpoint_time_s > 0:
+            tube = segments[0].tube
+            fill_volume_m3 = segments[0].fill_volume_m3
+            initial_ice_mass = RHO_ICE * fill_volume_m3
+            
+            simulated_endpoint = compute_simulated_endpoint_time(
+                all_ice_mass_trajectories, all_t_arrays, initial_ice_mass
+            )
+            fitted["simulated_endpoint_time_s"] = simulated_endpoint
+            fitted["mass_balance_residual"] = mass_balance_weight * (simulated_endpoint - endpoint_time_s) / endpoint_time_s
     else:
         # Legacy mode: independent segments
         for seg in segments:
