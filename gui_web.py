@@ -237,6 +237,10 @@ HTML_TEMPLATE = """
                     <input type="checkbox" id="plot_residuals" name="plot_residuals">
                     <label for="plot_residuals">Generate residual plots (PNG files)</label>
                 </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="run_sensitivity" name="run_sensitivity">
+                    <label for="run_sensitivity">Run contact area sensitivity analysis (diagnose Step 4 error)</label>
+                </div>
                 
                 <div style="margin-top: 15px; padding: 10px; background: #e8f4f8; border-radius: 4px;">
                     <strong>Endpoint Detection Parameters:</strong>
@@ -306,6 +310,24 @@ HTML_TEMPLATE = """
                             window.location.href = result.report_url;
                         }, 1000);
                     }
+                    
+                    // Auto-download sensitivity analysis files if available
+                    if (result.sensitivity_csv_url) {
+                        setTimeout(() => {
+                            const csvLink = document.createElement('a');
+                            csvLink.href = result.sensitivity_csv_url;
+                            csvLink.download = 'sensitivity_contact_area_results.csv';
+                            csvLink.click();
+                        }, 2000);
+                    }
+                    if (result.sensitivity_png_url) {
+                        setTimeout(() => {
+                            const pngLink = document.createElement('a');
+                            pngLink.href = result.sensitivity_png_url;
+                            pngLink.download = 'sensitivity_contact_area.png';
+                            pngLink.click();
+                        }, 3000);
+                    }
                 } else {
                     logDiv.innerHTML = `<span class="log-error">Error: ${result.error}</span>`;
                     statusBar.className = 'status-bar status-error';
@@ -350,6 +372,7 @@ def run_pipeline():
         use_transient = request.form.get('use_transient') == 'on'
         use_hybrid = request.form.get('hybrid_mode') == 'on'
         plot_residuals = request.form.get('plot_residuals') == 'on'
+        run_sensitivity = request.form.get('run_sensitivity') == 'on'
         
         # Parse endpoint detection parameters
         try:
@@ -384,6 +407,7 @@ def run_pipeline():
         log(f"  Transient mode: {use_transient}", 'info')
         log(f"  Hybrid mode: {use_hybrid}", 'info')
         log(f"  Plot residuals: {plot_residuals}", 'info')
+        log(f"  Run sensitivity analysis: {run_sensitivity}", 'info')
         log(f"  Rolling window: {rolling_window_minutes} min", 'info')
         log(f"  Sustain duration: {sustain_minutes} min", 'info')
         
@@ -620,6 +644,84 @@ def run_pipeline():
             except Exception as exc:
                 log(f"[warning] Failed to generate residual plots: {exc}", 'warning')
         
+        # Run contact area sensitivity analysis if requested
+        if run_sensitivity:
+            log("\n[7/7] Running contact area sensitivity analysis...", 'info')
+            try:
+                from sensitivity_contact_area import (
+                    CONTACT_EFFICIENCY_VALUES,
+                    run_sensitivity_analysis,
+                    print_summary_table,
+                    find_optimal_contact_efficiency,
+                    generate_plot,
+                )
+                
+                # Run sensitivity analysis
+                sens_results_df, sens_endpoint_diagnostics = run_sensitivity_analysis(
+                    input_csv=input_path,
+                    primary_phase_code=phase_code,
+                    fill_volume_ul=fill_volume_ul,
+                    calib_points=calibration_points,
+                    use_min_temp=use_min_temp,
+                    use_transient=use_transient_final,
+                    use_hybrid=use_hybrid,
+                )
+                
+                # Print summary table to log
+                log("\n=== CONTACT EFFICIENCY SENSITIVITY ANALYSIS ===", 'info')
+                valid_df = sens_results_df[sens_results_df['error'].isna()].copy()
+                if not valid_df.empty:
+                    header = (
+                        f"{'Contact Eff.':>14} | {'Kv':>12} | {'Rp0':>10} | {'A1':>10} | {'A2':>10} | "
+                        f"{'Overall RMS':>12} | {'Step 4 RMS':>12} | {'Total HTC':>12}"
+                    )
+                    log(header, 'info')
+                    log("-" * 100, 'info')
+                    
+                    for _, row in sens_results_df.iterrows():
+                        if row['error']:
+                            log(f"{row['contact_efficiency']:>14.2f} | FIT ERROR: {row['error'][:50]}", 'warning')
+                        else:
+                            line = (
+                                f"{row['contact_efficiency']:>14.2f} | {row['Kv']:>12.6f} | {row['Rp0']:>10.6f} | "
+                                f"{row['A1']:>10.6f} | {row['A2']:>10.6f} | {row['overall_rms_k']:>12.4f} | "
+                                f"{row['step_4_rms_k']:>12.4f} | {row['total_htc']:>12.6f}"
+                            )
+                            log(line, 'info')
+                    
+                    log("=" * 100, 'info')
+                    
+                    # Find optimal
+                    optimal_row = find_optimal_contact_efficiency(sens_results_df)
+                    if optimal_row is not None:
+                        optimal_value = optimal_row['contact_efficiency']
+                        metric_col = 'step_4_rms_k' if not np.isnan(optimal_row['step_4_rms_k']) else 'overall_rms_k'
+                        metric_name = 'Step 4 RMS' if not np.isnan(optimal_row['step_4_rms_k']) else 'Overall RMS'
+                        log(f"\n*** OPTIMAL CONTACT EFFICIENCY: {optimal_value:.2f} ***", 'success')
+                        log(f"    Minimizes {metric_name}: {optimal_row[metric_col]:.4f} K", 'info')
+                        log(f"    Corresponding Kv: {optimal_row['Kv']:.6f} W/m²/K", 'info')
+                        
+                        # Generate plot
+                        plot_out = Path(temp_dir) / "sensitivity_contact_area.png"
+                        csv_out = Path(temp_dir) / "sensitivity_contact_area_results.csv"
+                        
+                        sens_results_df.to_csv(csv_out, index=False)
+                        log(f"\nSaved results -> sensitivity_contact_area_results.csv", 'success')
+                        
+                        generate_plot(sens_results_df, plot_out, optimal_value)
+                        log(f"Saved plot -> sensitivity_contact_area.png", 'success')
+                        
+                        # Store filenames for download
+                        sensitivity_csv_filename = "sensitivity_contact_area_results.csv"
+                        sensitivity_png_filename = "sensitivity_contact_area.png"
+                else:
+                    log("[warning] No valid results from sensitivity analysis.", 'warning')
+                    
+            except ImportError as e:
+                log(f"[warning] Cannot import sensitivity_contact_area: {e}", 'warning')
+            except Exception as exc:
+                log(f"[warning] Sensitivity analysis failed: {exc}", 'warning')
+        
         log("\n" + "=" * 60, 'success')
         log("Pipeline completed successfully!", 'success')
         log("=" * 60, 'success')
@@ -630,10 +732,16 @@ def run_pipeline():
         except:
             pass
         
-        return jsonify({
+        # Build response with optional sensitivity file URLs
+        response_data = {
             'log': log_entries,
             'report_url': f'/download/{report_out}'
-        })
+        }
+        if run_sensitivity and 'sensitivity_csv_filename' in locals():
+            response_data['sensitivity_csv_url'] = f'/download/{sensitivity_csv_filename}'
+            response_data['sensitivity_png_url'] = f'/download/{sensitivity_png_filename}'
+        
+        return jsonify(response_data)
         
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
