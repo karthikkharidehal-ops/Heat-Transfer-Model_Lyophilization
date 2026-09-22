@@ -9,7 +9,7 @@ import pandas as pd
 
 MTORR_TO_PA = 0.13332
 MBAR_TO_PA = 100.0
-TP_COLUMNS = ["TP01", "TP02", "TP03", "TP04"]
+TP_COLUMNS = ["TP01", "TP02", "TP03", "TP04", "TP1", "TP2", "TP3", "TP4"]
 
 def _first_column(df, candidates, required=False):
     for col in candidates:
@@ -120,7 +120,7 @@ def normalize_units(df: pd.DataFrame) -> pd.DataFrame:
     df["vac_setpt_pa"] = _numeric_series(df, ["VacSetpt", "Vac Setpt", "Vacuum Setpt"]) * 0.133322
 
     # Temperature columns (all in C, convert to K)
-    shelf_temp_c = _numeric_series(df, ["ShelfTemp", "Shelf Temp"])
+    shelf_temp_c = _numeric_series(df, ["ShelfTemp", "Shelf Temp", "TS_x"])
     df["shelf_temp_k"] = shelf_temp_c + 273.15
 
     shelf_setpt_c = _numeric_series(df, ["ShelfSetpt", "Shelf Setpt"])

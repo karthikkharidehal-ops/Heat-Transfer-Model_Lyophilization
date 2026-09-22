@@ -55,6 +55,10 @@ class PipelineGUI:
         self.hybrid_mode = IntVar(value=0)
         self.plot_residuals = IntVar(value=0)
         
+        # Endpoint detection parameters
+        self.rolling_window_minutes = StringVar(value="30.0")
+        self.sustain_minutes = StringVar(value="30.0")
+        
         self.running = False
         
         self._build_ui()
@@ -119,11 +123,21 @@ class PipelineGUI:
         Checkbutton(options_frame, text="Generate residual plots (PNG files)",
                    variable=self.plot_residuals).grid(row=3, column=0, sticky='w', pady=5, padx=5)
         
+        # Endpoint detection parameters
+        Label(options_frame, text="Endpoint Detection Parameters:", font=('Arial', 10, 'bold')
+              ).grid(row=4, column=0, sticky='w', pady=(10, 5), padx=5)
+        
+        Label(options_frame, text="Rolling Window (min):").grid(row=5, column=0, sticky='w', pady=5, padx=5)
+        Entry(options_frame, textvariable=self.rolling_window_minutes, width=10).grid(row=5, column=1, sticky='w', padx=5, pady=5)
+        
+        Label(options_frame, text="Sustain Duration (min):").grid(row=6, column=0, sticky='w', pady=5, padx=5)
+        Entry(options_frame, textvariable=self.sustain_minutes, width=10).grid(row=6, column=1, sticky='w', padx=5, pady=5)
+        
         # Help text for hybrid mode
         help_text = ("Hybrid mode automatically detects Hold steps (steady shelf temp) vs "
                     "Ramp steps (changing shelf temp) and applies appropriate physics.")
         Label(options_frame, text=help_text, fg='blue', wraplength=600, justify='left'
-              ).grid(row=4, column=0, sticky='w', padx=5, pady=(0, 5))
+              ).grid(row=7, column=0, sticky='w', padx=5, pady=(0, 5))
         
         # === Run Button Section ===
         button_frame = Frame(main_frame)
@@ -229,6 +243,16 @@ class PipelineGUI:
             use_hybrid = bool(self.hybrid_mode.get())
             plot_residuals = bool(self.plot_residuals.get())
             
+            # Parse endpoint detection parameters
+            try:
+                rolling_window_minutes = float(self.rolling_window_minutes.get())
+                sustain_minutes = float(self.sustain_minutes.get())
+            except ValueError as e:
+                self._log(f"[error] Invalid endpoint detection parameter: {e}", 'error')
+                self.running = False
+                self.run_button.config(state='normal', bg='green')
+                return
+            
             self._log(f"\nInput file: {input_path.name}")
             self._log(f"Primary phase code: {phase_code_str}")
             self._log(f"Fill volume: {fill_volume_ul} µL")
@@ -241,6 +265,8 @@ class PipelineGUI:
             self._log(f"  Transient mode: {use_transient}")
             self._log(f"  Hybrid mode: {use_hybrid}")
             self._log(f"  Plot residuals: {plot_residuals}")
+            self._log(f"  Rolling window: {rolling_window_minutes} min")
+            self._log(f"  Sustain duration: {sustain_minutes} min")
             
             # Load and clean data
             self._log("\n[1/6] Loading and cleaning data...")
@@ -268,15 +294,22 @@ class PipelineGUI:
             # Use calibrated geometry
             tube = CalibratedPCRTubeGeometry(calibration_points=calibration_points)
             
-            # Detect primary drying endpoint using Pirani/Capman convergence
-            self._log("\n[2.5/6] Detecting primary drying endpoint (Pirani/Capman convergence)...")
-            endpoint_ts = find_endpoint(
+            # Detect primary drying endpoint using Pirani decline transition
+            self._log("\n[2.5/6] Detecting primary drying endpoint (Pirani decline transition)...")
+            result = find_endpoint(
                 df, 
-                abs_tol_pa=1.0, 
-                rel_tol=0.15, 
-                sustain_minutes=20.0
+                rolling_window_minutes=rolling_window_minutes,
+                sustain_minutes=sustain_minutes,
+                min_baseline_fraction=0.25
             )
+            endpoint_ts = result[0]
+            diagnostics = result[1]
             self._log(f"  Endpoint timestamp: {endpoint_ts}", 'info')
+            if diagnostics.get('primary_baseline') is not None:
+                self._log(f"  Primary drying baseline: {diagnostics['primary_baseline']:.3f} Pa", 'info')
+                self._log(f"  Post-drying baseline: {diagnostics['post_baseline']:.3f} Pa", 'info')
+                self._log(f"  Transition threshold: {diagnostics['threshold']:.3f} Pa", 'info')
+                self._log(f"  Transition detected: {diagnostics['detected']}", 'info')
             
             # Build segments using centralized physics with variance-based steady-state detection
             self._log("\n[3/6] Building drying segments...")
@@ -353,6 +386,13 @@ class PipelineGUI:
                 lines.append(f"    Duration: {seg.t_s[-1]:.0f}s ({seg.t_s[-1]/60:.1f} min)")
             
             lines.extend([
+                "",
+                "=== Endpoint Detection (Pirani Decline Transition) ===",
+                f"Primary drying baseline (median Pirani-CM diff, early phase): {diagnostics.get('primary_baseline', 'N/A'):.3f} Pa" if diagnostics.get('primary_baseline') is not None else "",
+                f"Post-drying baseline (median Pirani-CM diff, late phase): {diagnostics.get('post_baseline', 'N/A'):.3f} Pa" if diagnostics.get('post_baseline') is not None else "",
+                f"Transition threshold used: {diagnostics.get('threshold', 'N/A'):.3f} Pa" if diagnostics.get('threshold') is not None else "",
+                f"Detected endpoint timestamp: {endpoint_ts}",
+                f"Transition detected: {diagnostics.get('detected', False)}",
                 "",
                 "Fitted parameters:",
                 f"  Kv  = {fitted['Kv']:.6f}",

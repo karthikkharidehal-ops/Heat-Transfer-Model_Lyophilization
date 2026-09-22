@@ -305,32 +305,61 @@ def choose_product_temperature_column(df, use_min=False):
     )
 
 
-def find_endpoint(df, abs_tol_pa=1.0, rel_tol=0.15, sustain_minutes=20.0):
+def find_endpoint(
+    df,
+    rolling_window_minutes: float = 30.0,
+    sustain_minutes: float = 30.0,
+    min_baseline_fraction: float = 0.25,
+):
     """
-    Detect the primary drying endpoint using Pirani vs Capacitance Manometer convergence.
+    Detect the primary drying endpoint using Pirani decline transition.
     
-    The endpoint is triggered when the pressure difference between Pirani and Capacitance
-    Manometer readings falls below a threshold and remains there for a sustained period.
-    This indicates that water vapor sublimation has ceased (ice front disappeared).
+    CRITICAL PHYSICS: In this system, Pirani and CM never fully converge.
+    During primary drying, Pirani reads ~5.3 Pa (40 mTorr) higher than CM due to water vapor.
+    After primary drying, Pirani drops and stabilizes at ~1.3 Pa (10 mTorr) above CM.
+    The correct endpoint is when Pirani drops to this new baseline and stabilizes.
+    
+    Algorithm:
+    1. Calculate Pirani-CM difference: diff = pirani_pa - capman_pa
+    2. Compute rolling mean of difference over configurable window to smooth noise
+    3. Determine "primary drying baseline" as median diff during first 25% of data
+    4. Determine "post-drying baseline" as median diff during last 25% of data
+    5. Set transition threshold as midpoint between baselines
+    6. Endpoint is FIRST timestamp where rolling mean drops below threshold AND
+       remains below for sustained duration
     
     Parameters
     ----------
     df : pd.DataFrame
         DataFrame with 'timestamp', 'pirani_pa', and 'capman_pa' columns.
-    abs_tol_pa : float, default 1.0 Pa
-        Absolute tolerance for pressure difference.
-    rel_tol : float, default 0.15
-        Relative tolerance (fraction of capman_pa).
-    sustain_minutes : float, default 20.0
-        Minimum duration (in minutes) the convergence condition must be met continuously.
+    rolling_window_minutes : float, default 30.0
+        Window size for rolling mean smoothing in minutes.
+    sustain_minutes : float, default 30.0
+        Minimum duration (in minutes) the condition must be met continuously.
+    min_baseline_fraction : float, default 0.25
+        Fraction of data used to compute primary and post-drying baselines.
     
     Returns
     -------
     timestamp : pd.Timestamp or None
-        The exact timestamp when the endpoint was detected (start of sustained convergence).
-        If no sustained convergence is found, returns the last timestamp of the primary phase
+        The exact timestamp when the endpoint was detected (start of sustained transition).
+        If no sustained transition is found, returns the last timestamp of the primary phase
         and logs a warning.
+    diagnostics : dict
+        Dictionary containing:
+        - 'primary_baseline': Median Pirani-CM diff during early phase (Pa)
+        - 'post_baseline': Median Pirani-CM diff during late phase (Pa)
+        - 'threshold': Transition threshold used (Pa)
+        - 'detected': Boolean indicating if transition was detected
     """
+    # Initialize diagnostics
+    diagnostics = {
+        'primary_baseline': None,
+        'post_baseline': None,
+        'threshold': None,
+        'detected': False,
+    }
+    
     if "pirani_pa" not in df.columns or "capman_pa" not in df.columns:
         print(
             "[warn] Cannot detect endpoint: missing pirani_pa or capman_pa columns. "
@@ -338,11 +367,18 @@ def find_endpoint(df, abs_tol_pa=1.0, rel_tol=0.15, sustain_minutes=20.0):
             file=sys.stderr,
         )
         if "timestamp" in df.columns and len(df) > 0:
-            return df["timestamp"].iloc[-1]
-        return None
+            return df["timestamp"].iloc[-1], diagnostics
+        return None, diagnostics
+    
+    # Sort by timestamp and reset index
+    df_sorted = df.sort_values("timestamp").reset_index(drop=True)
     
     # Ensure we have valid data
-    valid_mask = df["pirani_pa"].notna() & df["capman_pa"].notna() & (df["capman_pa"] > 0)
+    valid_mask = (
+        df_sorted["pirani_pa"].notna() 
+        & df_sorted["capman_pa"].notna() 
+        & (df_sorted["capman_pa"] > 0)
+    )
     
     if not valid_mask.any():
         print(
@@ -350,97 +386,142 @@ def find_endpoint(df, abs_tol_pa=1.0, rel_tol=0.15, sustain_minutes=20.0):
             "Using last timestamp of primary phase as endpoint.",
             file=sys.stderr,
         )
-        if "timestamp" in df.columns and len(df) > 0:
-            return df["timestamp"].iloc[-1]
-        return None
+        if "timestamp" in df_sorted.columns and len(df_sorted) > 0:
+            return df_sorted["timestamp"].iloc[-1], diagnostics
+        return None, diagnostics
     
-    # Calculate convergence condition
-    diff_abs = (df["pirani_pa"] - df["capman_pa"]).abs()
-    diff_rel = diff_abs / df["capman_pa"]
+    # Filter to valid rows only for calculation
+    df_valid = df_sorted[valid_mask].copy().reset_index(drop=True)
     
-    # Convergence: either absolute OR relative tolerance is met
-    converged = (diff_abs < abs_tol_pa) | (diff_rel < rel_tol)
-    
-    # Only consider valid rows
-    converged = converged & valid_mask
-    
-    if not converged.any():
+    if len(df_valid) < 10:
         print(
-            "[warn] No convergence detected between Pirani and Capman pressures. "
+            "[warn] Insufficient valid data points for endpoint detection. "
             "Using last timestamp of primary phase as endpoint.",
             file=sys.stderr,
         )
-        if "timestamp" in df.columns and len(df) > 0:
-            return df["timestamp"].iloc[-1]
-        return None
+        if "timestamp" in df_sorted.columns and len(df_sorted) > 0:
+            return df_sorted["timestamp"].iloc[-1], diagnostics
+        return None, diagnostics
     
-    # Find sustained convergence periods
-    df_sorted = df.sort_values("timestamp").reset_index(drop=True)
-    converged_series = converged.reindex(df_sorted.index, fill_value=False)
+    # Step 1: Calculate Pirani-CM difference
+    diff = df_valid["pirani_pa"] - df_valid["capman_pa"]
     
-    # Convert sustain_minutes to number of samples based on median sampling interval
-    timestamps = df_sorted["timestamp"].dropna()
-    if len(timestamps) < 2:
-        print(
-            "[warn] Insufficient timestamps for endpoint detection. "
-            "Using last timestamp as endpoint.",
-            file=sys.stderr,
-        )
-        return timestamps.iloc[-1] if len(timestamps) > 0 else None
-    
+    # Step 2: Compute rolling mean of difference
+    timestamps = df_valid["timestamp"]
     time_diffs = timestamps.diff().dt.total_seconds().dropna()
-    median_interval_sec = time_diffs.median()
+    median_interval_sec = time_diffs.median() if len(time_diffs) > 0 else 60.0
     
     if median_interval_sec <= 0:
-        median_interval_sec = 60.0  # Default to 1 minute if calculation fails
+        median_interval_sec = 60.0
     
-    sustain_seconds = sustain_minutes * 60.0
-    min_consecutive_points = int(np.ceil(sustain_seconds / median_interval_sec))
-    min_consecutive_points = max(min_consecutive_points, 1)  # At least 1 point
+    # Convert rolling window to number of samples
+    rolling_window_sec = rolling_window_minutes * 60.0
+    rolling_window_samples = max(int(np.ceil(rolling_window_sec / median_interval_sec)), 1)
     
-    # Find runs of consecutive True values
-    converged_values = converged_series.values
-    indices = np.where(converged_values)[0]
+    # Apply rolling mean to smooth noise
+    diff_rolling = diff.rolling(window=rolling_window_samples, min_periods=1).mean()
     
-    if len(indices) == 0:
+    # Step 3: Determine primary drying baseline (first 25% of data)
+    n_points = len(diff_rolling)
+    baseline_n = max(int(np.ceil(n_points * min_baseline_fraction)), 1)
+    
+    primary_baseline = float(diff_rolling.iloc[:baseline_n].median())
+    diagnostics['primary_baseline'] = primary_baseline
+    
+    # Step 4: Determine post-drying baseline (last 25% of data)
+    post_baseline = float(diff_rolling.iloc[-baseline_n:].median())
+    diagnostics['post_baseline'] = post_baseline
+    
+    # Step 5: Set transition threshold as midpoint between baselines
+    threshold = (primary_baseline + post_baseline) / 2.0
+    diagnostics['threshold'] = threshold
+    
+    print(
+        f"[info] Endpoint detection: primary_baseline={primary_baseline:.3f} Pa, "
+        f"post_baseline={post_baseline:.3f} Pa, threshold={threshold:.3f} Pa",
+        file=sys.stderr,
+    )
+    
+    # Sanity check: if baselines are very close or inverted, use fallback
+    if primary_baseline <= post_baseline:
         print(
-            "[warn] No convergence points found. Using last timestamp as endpoint.",
+            "[warn] Primary baseline <= post-baseline (unexpected). "
+            "Using last timestamp of primary phase as endpoint.",
             file=sys.stderr,
         )
-        return df_sorted["timestamp"].iloc[-1]
+        return df_sorted["timestamp"].iloc[-1], diagnostics
+    
+    # Step 6: Find first point where rolling mean drops below threshold
+    below_threshold = diff_rolling < threshold
+    
+    if not below_threshold.any():
+        print(
+            "[warn] Rolling mean never drops below threshold. "
+            "Using last timestamp of primary phase as endpoint.",
+            file=sys.stderr,
+        )
+        return df_sorted["timestamp"].iloc[-1], diagnostics
+    
+    # Convert sustain_minutes to number of samples
+    sustain_sec = sustain_minutes * 60.0
+    min_sustain_points = max(int(np.ceil(sustain_sec / median_interval_sec)), 1)
+    
+    # Find runs of consecutive True values where diff_rolling stays below threshold
+    below_values = below_threshold.values
+    
+    # Find all indices where condition is True
+    true_indices = np.where(below_values)[0]
+    
+    if len(true_indices) == 0:
+        print(
+            "[warn] No points below threshold found. "
+            "Using last timestamp of primary phase as endpoint.",
+            file=sys.stderr,
+        )
+        return df_sorted["timestamp"].iloc[-1], diagnostics
     
     # Group consecutive indices into runs
     runs = []
-    current_run = [indices[0]]
+    current_run = [true_indices[0]]
     
-    for i in range(1, len(indices)):
-        if indices[i] == indices[i-1] + 1:
-            current_run.append(indices[i])
+    for i in range(1, len(true_indices)):
+        if true_indices[i] == true_indices[i-1] + 1:
+            current_run.append(true_indices[i])
         else:
-            if len(current_run) >= min_consecutive_points:
+            if len(current_run) >= min_sustain_points:
                 runs.append(current_run)
-            current_run = [indices[i]]
+            current_run = [true_indices[i]]
     
     # Don't forget the last run
-    if len(current_run) >= min_consecutive_points:
+    if len(current_run) >= min_sustain_points:
         runs.append(current_run)
     
     if not runs:
         print(
-            f"[warn] No sustained convergence found (need {min_consecutive_points} consecutive points). "
-            "Using last timestamp as endpoint.",
+            f"[warn] No sustained transition found (need {min_sustain_points} consecutive points). "
+            "Using last timestamp of primary phase as endpoint.",
             file=sys.stderr,
         )
-        return df_sorted["timestamp"].iloc[-1]
+        return df_sorted["timestamp"].iloc[-1], diagnostics
     
-    # Return the timestamp at the START of the first sustained convergence period
-    first_run_start_idx = runs[0][0]
-    endpoint_timestamp = df_sorted.iloc[first_run_start_idx]["timestamp"]
+    # Return the timestamp at the START of the first sustained transition period
+    first_run_start_idx_in_valid = runs[0][0]
     
-    print(f"[info] Primary drying endpoint detected at {endpoint_timestamp}. "
-          f"All data after this timestamp will be excluded from the fit.")
+    # Map back to original sorted dataframe index
+    # We need to find the corresponding index in df_sorted
+    valid_indices = df_valid.index.tolist()
+    first_run_start_idx_in_sorted = valid_indices[first_run_start_idx_in_valid]
+    endpoint_timestamp = df_sorted.iloc[first_run_start_idx_in_sorted]["timestamp"]
     
-    return endpoint_timestamp
+    diagnostics['detected'] = True
+    
+    print(
+        f"[info] Primary drying endpoint detected at {endpoint_timestamp}. "
+        f"All data after this timestamp will be excluded from the fit.",
+        file=sys.stderr,
+    )
+    
+    return endpoint_timestamp, diagnostics
 
 
 def build_segments(
