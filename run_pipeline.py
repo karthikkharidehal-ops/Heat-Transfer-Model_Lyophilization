@@ -178,6 +178,12 @@ def main():
         rel_tol=0.15, 
         sustain_minutes=20.0
     )
+    
+    # Calculate endpoint as time from start of process (in seconds)
+    first_timestamp = df["timestamp"].min()
+    endpoint_time_from_start = None
+    if endpoint_ts is not None and pd.notna(first_timestamp):
+        endpoint_time_from_start = (endpoint_ts - first_timestamp).total_seconds()
 
     # Build primary-drying segments (truncated at endpoint)
     segments = build_segments(
@@ -241,13 +247,21 @@ def main():
         f"Calibration points used: {len(calibration_points)}",
         "",
         f"Primary drying endpoint detected at {endpoint_ts}. All data after this timestamp was excluded from the fit.",
+        f"Pirani and Capacitance Manometer (CM) merge time: {endpoint_ts}",
+    ]
+    
+    if endpoint_time_from_start is not None:
+        lines.append(f"Endpoint time from start of process: {endpoint_time_from_start:.1f} seconds ({endpoint_time_from_start/60:.1f} minutes)")
+    
+    lines.extend([
+        "(This marks the primary drying endpoint when water vapor sublimation ceased)",
         "",
         "Steady-state detection based on measured signal variance:",
         f"  Shelf temp threshold: std < 0.1 K",
         f"  Pressure threshold: std < 5.0 Pa (capacitance manometer)",
         "",
         "Detected step classification (Hold vs Ramp):",
-    ]
+    ])
     
     # Report detected step types with their characteristics AND measured variance proof
     for seg in segments:
@@ -267,10 +281,49 @@ def main():
         classification_reason = "BOTH stable → HOLD" if seg.is_hold_step else "One or both signals unstable → RAMP"
         lines.append(f"    Classification: {classification_reason}")
     
+    # Add endpoint truncation diagnostics
     lines.extend([
         "",
-        f"Pirani and Capacitance Manometer (CM) merge time: {endpoint_ts}",
-        "(This marks the primary drying endpoint when water vapor sublimation ceased)",
+        "Endpoint truncation diagnostics:",
+    ])
+    
+    # Re-run build_segments to capture truncation diagnostics
+    import io as io_module
+    from contextlib import redirect_stdout
+    
+    diag_output = io_module.StringIO()
+    with redirect_stdout(diag_output):
+        build_segments(
+            df_clean,
+            phase_code,
+            tube,
+            fill_volume_m3,
+            endpoint_timestamp=endpoint_ts,
+            min_segment_points=args.min_segment_points,
+        )
+    truncation_diagnostics = diag_output.getvalue()
+    
+    if truncation_diagnostics.strip():
+        for line in truncation_diagnostics.strip().split('\n'):
+            if line.startswith('[DIAG]'):
+                lines.append(line)
+    else:
+        lines.append("  No rows dropped due to endpoint truncation.")
+    
+    # Count total rows excluded
+    total_rows_before = len(df_clean[df_clean["Phase"] == phase_code])
+    total_rows_after = sum(len(seg.t_s) for seg in segments)
+    rows_excluded = total_rows_before - total_rows_after
+    
+    lines.extend([
+        "",
+        f"Data exclusion summary:",
+        f"  Total rows in primary phase before truncation: {total_rows_before}",
+        f"  Total rows used in fit after truncation: {total_rows_after}",
+        f"  Total rows excluded (endpoint + invalid): {rows_excluded}",
+    ])
+    
+    lines.extend([
         "",
         "Fitted parameters:",
         f"  Kv  = {fitted['Kv']:.6f}",
@@ -293,11 +346,17 @@ def main():
             "[STATE-CONTINUITY] Diagnostics (from continuous simulation):",
         ])
         # Re-run simulation to capture state continuity prints
-        print("\n[CLI] State continuity diagnostics for fit:")
-        simulate_continuous_primary_drying(
-            segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
-        )
-
+        import io
+        from contextlib import redirect_stdout
+        
+        f = io.StringIO()
+        with redirect_stdout(f):
+            simulate_continuous_primary_drying(
+                segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
+            )
+        state_output = f.getvalue()
+        lines.append(state_output)
+    
     report = "\n".join(lines)
 
     print("\n" + report)

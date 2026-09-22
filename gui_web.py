@@ -401,6 +401,13 @@ def run_pipeline():
         )
         log(f"  Endpoint timestamp: {endpoint_ts}", 'info')
         
+        # Calculate endpoint as time from start of process (in seconds)
+        first_timestamp = df["timestamp"].min()
+        endpoint_time_from_start = None
+        if endpoint_ts is not None and pd.notna(first_timestamp):
+            endpoint_time_from_start = (endpoint_ts - first_timestamp).total_seconds()
+            log(f"  Endpoint time from start: {endpoint_time_from_start:.1f}s ({endpoint_time_from_start/60:.1f} min)", 'info')
+        
         # Build segments using centralized physics with variance-based steady-state detection
         log("\n[3/6] Building drying segments...", 'info')
         segments = build_segments(
@@ -477,6 +484,10 @@ def run_pipeline():
         
         lines.extend([
             "",
+            f"Pirani and Capacitance Manometer (CM) merge time: {endpoint_ts}",
+            f"Endpoint time from start of process: {endpoint_time_from_start:.1f} seconds ({endpoint_time_from_start/60:.1f} minutes)" if endpoint_time_from_start is not None else "",
+            "(This marks the primary drying endpoint when water vapor sublimation ceased)",
+            "",
             "Fitted parameters:",
             f"  Kv  = {fitted['Kv']:.6f}",
             f"  Rp0 = {fitted['Rp0']:.6f}",
@@ -498,11 +509,17 @@ def run_pipeline():
                 "[STATE-CONTINUITY] Diagnostics (from continuous simulation):",
             ])
             # Re-run simulation to capture state continuity prints
-            print("\n[GUI] State continuity diagnostics for fit:")
-            simulate_continuous_primary_drying(
-                segments, fitted['Kv'], fitted['Rp0'], fitted['A1'], fitted['A2'],
-                use_hybrid=use_hybrid
-            )
+            import io
+            from contextlib import redirect_stdout
+            
+            f = io.StringIO()
+            with redirect_stdout(f):
+                simulate_continuous_primary_drying(
+                    segments, fitted['Kv'], fitted['Rp0'], fitted['A1'], fitted['A2'],
+                    use_hybrid=use_hybrid
+                )
+            state_output = f.getvalue()
+            lines.append(state_output)
         
         report = "\n".join(lines)
         report_path = Path(temp_dir) / report_out
