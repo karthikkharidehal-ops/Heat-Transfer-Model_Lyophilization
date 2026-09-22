@@ -172,12 +172,17 @@ def main():
     )
 
     # Detect primary drying endpoint using Pirani/Capman convergence
-    endpoint_ts = find_endpoint(
+    endpoint_result = find_endpoint(
         df, 
-        abs_tol_pa=1.0, 
-        rel_tol=0.15, 
+        rolling_window_minutes=30.0, 
         sustain_minutes=20.0
     )
+    # find_endpoint returns (timestamp, diagnostics) tuple
+    if isinstance(endpoint_result, tuple):
+        endpoint_ts, endpoint_diagnostics = endpoint_result
+    else:
+        endpoint_ts = endpoint_result
+        endpoint_diagnostics = {}
     
     # Calculate endpoint as time from start of process (in seconds)
     first_timestamp = df["timestamp"].min()
@@ -296,12 +301,12 @@ def main():
     diag_output = io_module.StringIO()
     with redirect_stdout(diag_output):
         build_segments(
-            df_clean,
+            df,
             phase_code,
             tube,
             fill_volume_m3,
             endpoint_timestamp=endpoint_ts,
-            min_segment_points=args.min_segment_points,
+            min_segment_points=args.min_segment_points if hasattr(args, 'min_segment_points') else 10,
         )
     truncation_diagnostics = diag_output.getvalue()
     
@@ -313,7 +318,7 @@ def main():
         lines.append("  No rows dropped due to endpoint truncation.")
     
     # Count total rows excluded
-    total_rows_before = len(df_clean[df_clean["Phase"] == phase_code])
+    total_rows_before = len(df[df["Phase"] == phase_code])
     total_rows_after = sum(len(seg.t_s) for seg in segments)
     rows_excluded = total_rows_before - total_rows_after
     
