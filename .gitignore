@@ -14,6 +14,10 @@ __pycache__/
 .env.local
 *.env.*
 
+# Editors
+.vscode/
+.idea/
+
 # Dependencies
 .venv/
 venv/

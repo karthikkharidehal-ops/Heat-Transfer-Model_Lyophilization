@@ -311,6 +311,16 @@ class PipelineGUI:
                 self._log(f"  Transition threshold: {diagnostics['threshold']:.3f} Pa", 'info')
                 self._log(f"  Transition detected: {diagnostics['detected']}", 'info')
             
+            # Calculate endpoint time in seconds from start of primary drying
+            endpoint_time_s = None
+            if endpoint_ts is not None:
+                # Get first timestamp of primary phase for relative time calculation
+                primary_df = df[df["Phase"] == phase_code].copy()
+                if len(primary_df) > 0:
+                    first_timestamp = primary_df["timestamp"].min()
+                    endpoint_time_s = (endpoint_ts - first_timestamp).total_seconds()
+                    self._log(f"  Endpoint time from start of primary drying: {endpoint_time_s:.1f} s", 'info')
+            
             # Build segments using centralized physics with variance-based steady-state detection
             self._log("\n[3/6] Building drying segments...")
             segments = build_segments(
@@ -342,7 +352,9 @@ class PipelineGUI:
             fitted = fit_parameters_joint(
                 segments,
                 use_transient=use_transient_final,
-                use_hybrid=use_hybrid
+                use_hybrid=use_hybrid,
+                endpoint_time_s=endpoint_time_s,
+                mass_balance_weight=1.0
             )
             
             if not fitted['converged']:
@@ -392,7 +404,13 @@ class PipelineGUI:
                 f"Post-drying baseline (median Pirani-CM diff, late phase): {diagnostics.get('post_baseline', 'N/A'):.3f} Pa" if diagnostics.get('post_baseline') is not None else "",
                 f"Transition threshold used: {diagnostics.get('threshold', 'N/A'):.3f} Pa" if diagnostics.get('threshold') is not None else "",
                 f"Detected endpoint timestamp: {endpoint_ts}",
+                f"Endpoint time from start of primary drying: {endpoint_time_s:.1f} s" if endpoint_time_s is not None else "",
                 f"Transition detected: {diagnostics.get('detected', False)}",
+                "",
+                "=== Mass-Balance Constraint ===",
+                f"Detected endpoint time: {endpoint_time_s:.1f} s" if endpoint_time_s is not None else "Detected endpoint time: N/A",
+                f"Simulated endpoint time: {fitted.get('simulated_endpoint_time_s', 'N/A'):.1f} s" if fitted.get('simulated_endpoint_time_s') is not None else "Simulated endpoint time: N/A",
+                f"Mass-balance residual: {fitted.get('mass_balance_residual', 'N/A'):.6f}" if fitted.get('mass_balance_residual') is not None else "Mass-balance residual: N/A (endpoint not provided)",
                 "",
                 "Fitted parameters:",
                 f"  Kv  = {fitted['Kv']:.6f}",
