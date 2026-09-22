@@ -237,6 +237,19 @@ HTML_TEMPLATE = """
                     <input type="checkbox" id="plot_residuals" name="plot_residuals">
                     <label for="plot_residuals">Generate residual plots (PNG files)</label>
                 </div>
+                
+                <div style="margin-top: 15px; padding: 10px; background: #e8f4f8; border-radius: 4px;">
+                    <strong>Endpoint Detection Parameters:</strong>
+                    <div class="form-group" style="margin-top: 10px;">
+                        <label for="rolling_window_minutes">Rolling Window (min):</label>
+                        <input type="number" id="rolling_window_minutes" name="rolling_window_minutes" value="30.0" step="1.0" min="1.0">
+                    </div>
+                    <div class="form-group">
+                        <label for="sustain_minutes">Sustain Duration (min):</label>
+                        <input type="number" id="sustain_minutes" name="sustain_minutes" value="30.0" step="1.0" min="1.0">
+                    </div>
+                </div>
+                
                 <div class="help-text" style="margin-top: 15px; padding: 10px; background: #e8f4f8; border-radius: 4px;">
                     💡 <strong>Hybrid mode</strong> automatically detects Hold steps (steady shelf temp) vs Ramp steps 
                     (changing shelf temp) and applies appropriate physics. This is the recommended approach for most cycles.
@@ -338,6 +351,13 @@ def run_pipeline():
         use_hybrid = request.form.get('hybrid_mode') == 'on'
         plot_residuals = request.form.get('plot_residuals') == 'on'
         
+        # Parse endpoint detection parameters
+        try:
+            rolling_window_minutes = float(request.form.get('rolling_window_minutes', '30.0'))
+            sustain_minutes = float(request.form.get('sustain_minutes', '30.0'))
+        except ValueError as e:
+            return jsonify({'error': f'Invalid endpoint detection parameter: {e}'}), 400
+        
         log_entries = []
         
         def log(text, tag='info'):
@@ -364,6 +384,8 @@ def run_pipeline():
         log(f"  Transient mode: {use_transient}", 'info')
         log(f"  Hybrid mode: {use_hybrid}", 'info')
         log(f"  Plot residuals: {plot_residuals}", 'info')
+        log(f"  Rolling window: {rolling_window_minutes} min", 'info')
+        log(f"  Sustain duration: {sustain_minutes} min", 'info')
         
         # Load and clean data
         log("\n[1/6] Loading and cleaning data...", 'info')
@@ -391,15 +413,22 @@ def run_pipeline():
         # Use calibrated geometry
         tube = CalibratedPCRTubeGeometry(calibration_points=calibration_points)
         
-        # Detect primary drying endpoint using Pirani/Capman convergence
-        log("\n[2.5/6] Detecting primary drying endpoint (Pirani/Capman convergence)...", 'info')
-        endpoint_ts = find_endpoint(
+        # Detect primary drying endpoint using Pirani decline transition
+        log("\n[2.5/6] Detecting primary drying endpoint (Pirani decline transition)...", 'info')
+        result = find_endpoint(
             df, 
-            abs_tol_pa=1.0, 
-            rel_tol=0.15, 
-            sustain_minutes=20.0
+            rolling_window_minutes=rolling_window_minutes,
+            sustain_minutes=sustain_minutes,
+            min_baseline_fraction=0.25
         )
+        endpoint_ts = result[0]
+        diagnostics = result[1]
         log(f"  Endpoint timestamp: {endpoint_ts}", 'info')
+        if diagnostics.get('primary_baseline') is not None:
+            log(f"  Primary drying baseline: {diagnostics['primary_baseline']:.3f} Pa", 'info')
+            log(f"  Post-drying baseline: {diagnostics['post_baseline']:.3f} Pa", 'info')
+            log(f"  Transition threshold: {diagnostics['threshold']:.3f} Pa", 'info')
+            log(f"  Transition detected: {diagnostics['detected']}", 'info')
         
         # Calculate endpoint as time from start of process (in seconds)
         first_timestamp = df["timestamp"].min()
@@ -484,9 +513,12 @@ def run_pipeline():
         
         lines.extend([
             "",
-            f"Pirani and Capacitance Manometer (CM) merge time: {endpoint_ts}",
-            f"Endpoint time from start of process: {endpoint_time_from_start:.1f} seconds ({endpoint_time_from_start/60:.1f} minutes)" if endpoint_time_from_start is not None else "",
-            "(This marks the primary drying endpoint when water vapor sublimation ceased)",
+            "=== Endpoint Detection (Pirani Decline Transition) ===",
+            f"Primary drying baseline (median Pirani-CM diff, early phase): {diagnostics.get('primary_baseline', 'N/A'):.3f} Pa" if diagnostics.get('primary_baseline') is not None else "",
+            f"Post-drying baseline (median Pirani-CM diff, late phase): {diagnostics.get('post_baseline', 'N/A'):.3f} Pa" if diagnostics.get('post_baseline') is not None else "",
+            f"Transition threshold used: {diagnostics.get('threshold', 'N/A'):.3f} Pa" if diagnostics.get('threshold') is not None else "",
+            f"Detected endpoint timestamp: {endpoint_ts}",
+            f"Transition detected: {diagnostics.get('detected', False)}",
             "",
             "Fitted parameters:",
             f"  Kv  = {fitted['Kv']:.6f}",
