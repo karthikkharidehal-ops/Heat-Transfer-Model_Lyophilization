@@ -336,7 +336,19 @@ def main():
         f"Detected endpoint time: {endpoint_time_from_start:.1f} s" if endpoint_time_from_start is not None else "Detected endpoint time: N/A",
         f"Simulated endpoint time: {fitted.get('simulated_endpoint_time_s', 'N/A'):.1f} s" if fitted.get('simulated_endpoint_time_s') is not None else "Simulated endpoint time: N/A",
         f"Mass-balance residual: {fitted.get('mass_balance_residual', 'N/A'):.6f}" if fitted.get('mass_balance_residual') is not None else "Mass-balance residual: N/A (endpoint not provided)",
-        "",
+    ])
+    
+    # Add detailed mass-balance physics if available
+    if fitted.get('initial_ice_mass_kg') is not None:
+        lines.extend([
+            f"Initial ice mass: {fitted['initial_ice_mass_kg']:.9f} kg",
+            f"Final ice mass (at end of simulation): {fitted.get('final_ice_mass_kg', 'N/A'):.9f} kg" if fitted.get('final_ice_mass_kg') is not None else "Final ice mass (at end of simulation): N/A",
+            f"Ice depletion threshold (1% of initial): {fitted['initial_ice_mass_kg'] * 0.01:.9f} kg",
+        ])
+        if fitted.get('ice_depletion_rate_kg_s') is not None:
+            lines.append(f"Mean ice depletion rate (final segment): {fitted['ice_depletion_rate_kg_s']:.9e} kg/s")
+        if fitted.get('extrapolation_used', False):
+            lines.append("Note: Endpoint was extrapolated beyond simulated window using depletion rate.")
         "Fitted parameters:",
         f"  Kv  = {fitted['Kv']:.6f}",
         f"  Rp0 = {fitted['Rp0']:.6f}",
