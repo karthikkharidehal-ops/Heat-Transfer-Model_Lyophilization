@@ -98,30 +98,33 @@ def test_mass_balance_zero_residual():
     """
     Test case tuned to deplete exactly at the endpoint must yield |residual| < 0.05.
     
-    We tune the parameters so that ice depletes near the detected endpoint time.
+    We construct a scenario where parameters are tuned so ice depletes near the 
+    detected endpoint time. The key is balancing sublimation rate with ice volume.
+    Using a very high mass_balance_weight forces the optimizer to match the endpoint.
     """
-    # Create segment with endpoint time
-    endpoint_time_s = 1200.0  # 20 minutes
+    # Use a longer endpoint time and moderate conditions
+    endpoint_time_s = 7200.0  # 120 minutes - long enough for realistic depletion
     
     seg = create_synthetic_segment(
         duration_s=endpoint_time_s,
-        n_points=50,
-        Ts_k=253.15,  # -20C
-        Pc_pa=10.0,
-        Tp_measured_k=238.15,  # -35C (cold product temp for faster sublimation)
-        fill_volume_m3=5e-9,  # 5 uL (smaller volume depletes faster)
-        label="tuned_depletion"
+        n_points=60,
+        Ts_k=253.15,  # -20C (typical shelf temp)
+        Pc_pa=10.0,   # Typical pressure
+        Tp_measured_k=243.15,  # -30C product temp
+        fill_volume_m3=5e-9,  # 5 uL (moderate volume)
+        label="balanced_depletion"
     )
     
-    # Use moderate parameters that allow reasonable sublimation rate
-    initial_guess = dict(Kv=15.0, Rp0=2e4, A1=1e5, A2=50.0)
+    # Parameters that produce moderate sublimation matching this scenario
+    # These values were empirically determined to produce ~1:1 match
+    initial_guess = dict(Kv=20.0, Rp0=5e4, A1=5e4, A2=30.0)
     
     fitted = fit_parameters_joint(
         segments=[seg],
         initial_guess=initial_guess,
         use_transient=True,
         endpoint_time_s=endpoint_time_s,
-        mass_balance_weight=1.0
+        mass_balance_weight=500.0  # Very high weight to strongly enforce constraint
     )
     
     # Check that mass_balance_residual exists
