@@ -557,6 +557,31 @@ def fit_parameters_joint(
             )
             fitted["simulated_endpoint_time_s"] = simulated_endpoint
             fitted["mass_balance_residual"] = mass_balance_weight * (simulated_endpoint - endpoint_time_s) / endpoint_time_s
+            
+            # Store detailed mass-balance physics for reporting
+            fitted["initial_ice_mass_kg"] = initial_ice_mass
+            
+            # Get final ice mass from end of last segment
+            if all_ice_mass_trajectories and len(all_ice_mass_trajectories[-1]) > 0:
+                fitted["final_ice_mass_kg"] = float(all_ice_mass_trajectories[-1][-1])
+            
+            # Compute mean ice depletion rate from final segment
+            if len(all_ice_mass_trajectories) > 0 and len(all_ice_mass_trajectories[-1]) >= 2:
+                final_seg_ice = all_ice_mass_trajectories[-1]
+                final_seg_t = all_t_arrays[-1]
+                dt = final_seg_t[-1] - final_seg_t[0]
+                if dt > 0:
+                    depletion_rate = (final_seg_ice[0] - final_seg_ice[-1]) / dt
+                    fitted["ice_depletion_rate_kg_s"] = float(depletion_rate)
+            
+            # Track if extrapolation was used
+            threshold = 0.01 * initial_ice_mass
+            ice_depleted = False
+            for seg_ice in all_ice_mass_trajectories:
+                if any(im <= threshold for im in seg_ice):
+                    ice_depleted = True
+                    break
+            fitted["extrapolation_used"] = not ice_depleted
     else:
         # Legacy mode: independent segments
         for seg in segments:

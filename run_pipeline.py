@@ -349,6 +349,9 @@ def main():
             lines.append(f"Mean ice depletion rate (final segment): {fitted['ice_depletion_rate_kg_s']:.9e} kg/s")
         if fitted.get('extrapolation_used', False):
             lines.append("Note: Endpoint was extrapolated beyond simulated window using depletion rate.")
+    
+    lines.extend([
+        "",
         "Fitted parameters:",
         f"  Kv  = {fitted['Kv']:.6f}",
         f"  Rp0 = {fitted['Rp0']:.6f}",
