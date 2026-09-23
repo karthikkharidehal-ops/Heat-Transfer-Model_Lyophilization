@@ -1,13 +1,13 @@
 === Joint Pikal model fit ===
 Input file: test_data.csv
 Primary phase code used: 6
-Fill volume: 12.0 uL
+Fill volume: 16.0 uL
 Pressure column used: capman_pa
-Product temperature column used: prod_avg_k
-Using minimum probe temperature (ice-front approx): False
+Product temperature column used: prod_min_k
+Using minimum probe temperature (ice-front approx): True
 Using transient mode (for multi-step ramps): False
 Using hybrid mode (measured signal variance Hold/Ramp detection): True
-Calibration points used: 0
+Calibration points used: 3
 
 Primary drying endpoint detected at 2024-01-01 01:39:00. All data after this timestamp was excluded from the fit.
 Pirani and Capacitance Manometer (CM) merge time: 2024-01-01 01:39:00
@@ -46,21 +46,26 @@ Data exclusion summary:
 
 === Mass-Balance Constraint ===
 Detected endpoint time: 5940.0 s
-Simulated endpoint time: 16429.3 s
-Mass-balance residual: 1.765878
+Simulated endpoint time: 20536.5 s
+Mass-balance residual: 2.457326
+Initial ice mass: 0.000014688 kg
+Final ice mass (at end of simulation): 0.000011277 kg
+Ice depletion threshold (1% of initial): 0.000000147 kg
+Mean ice depletion rate (final segment): 6.897999953e-10 kg/s
+Note: Endpoint was extrapolated beyond simulated window using depletion rate.
 
 Fitted parameters:
-  Kv  = 33.567098
-  Rp0 = 217434.448484
-  A1  = 22.052353
-  A2  = 19179.058404
-  Overall RMS error: 0.302514 K
+  Kv  = 42.295186
+  Rp0 = 179089.517256
+  A1  = 0.046473
+  A2  = 65798.839718
+  Overall RMS error: 0.402386 K
   Converged: True
 
 Per-segment fit quality (RMS error in K):
-  cycle=1_step=2: 0.204864 K
-  cycle=1_step=3: 0.270549 K
+  cycle=1_step=2: 0.262153 K
+  cycle=1_step=3: 0.348349 K
 
 [STATE-CONTINUITY] Diagnostics (from continuous simulation):
-[STATE-CONTINUITY] Segment 0 (cycle=1_step=2): L_start = 0.000000 m, ice_mass = 0.000011016 kg
-[STATE-CONTINUITY] Segment 1 (cycle=1_step=3): L_start = 0.000531 m, ice_mass = 0.000008973 kg
+[STATE-CONTINUITY] Segment 0 (cycle=1_step=2): L_start = 0.000000 m, ice_mass = 0.000014688 kg
+[STATE-CONTINUITY] Segment 1 (cycle=1_step=3): L_start = 0.000642 m, ice_mass = 0.000012477 kg
