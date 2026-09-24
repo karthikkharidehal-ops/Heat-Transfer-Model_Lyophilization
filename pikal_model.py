@@ -421,6 +421,9 @@ def fit_parameters_joint(
     _endpoint_time_s = endpoint_time_s
     _mass_balance_weight = mass_balance_weight
 
+    # Track whether the mass-balance penalty branch actually executed during the fit
+    _mass_balance_state = {"active": False}
+
     def compute_simulated_endpoint_time(ice_mass_trajectories: list[np.ndarray], 
                                          t_arrays: list[np.ndarray],
                                          initial_ice_mass: float) -> float:
@@ -508,7 +511,8 @@ def fit_parameters_joint(
                 simulated_endpoint = compute_simulated_endpoint_time(
                     all_ice_mass_trajectories, all_t_arrays, initial_ice_mass
                 )
-                
+                _mass_balance_state["active"] = True
+
                 # Normalized mass-balance residual
                 mass_residual = _mass_balance_weight * (simulated_endpoint - _endpoint_time_s) / _endpoint_time_s
                 out.append(np.array([mass_residual]))
@@ -534,6 +538,14 @@ def fit_parameters_joint(
     fitted["rms_error_k"] = float(np.sqrt(np.mean(fun_vals ** 2)))
     fitted["converged"] = bool(success)
 
+    # Mass-balance closure diagnostics (always present in the result dict).
+    # mass_balance_active is True only when endpoint_time_s was provided AND the
+    # penalty branch inside resid() actually executed during the fit.
+    fitted["detected_endpoint_time_s"] = endpoint_time_s if (endpoint_time_s is not None and endpoint_time_s > 0) else None
+    fitted["simulated_endpoint_time_s"] = None
+    fitted["mass_balance_residual"] = None
+    fitted["mass_balance_active"] = bool(_mass_balance_state["active"])
+
     # Calculate per-segment RMS errors and mass-balance diagnostics using continuous simulation
     per_segment = {}
     Kv, Rp0, A1, A2 = x_vals
@@ -556,7 +568,33 @@ def fit_parameters_joint(
                 all_ice_mass_trajectories, all_t_arrays, initial_ice_mass
             )
             fitted["simulated_endpoint_time_s"] = simulated_endpoint
+            fitted["detected_endpoint_time_s"] = endpoint_time_s
             fitted["mass_balance_residual"] = mass_balance_weight * (simulated_endpoint - endpoint_time_s) / endpoint_time_s
+            
+            # Store detailed mass-balance physics for reporting
+            fitted["initial_ice_mass_kg"] = initial_ice_mass
+            
+            # Get final ice mass from end of last segment
+            if all_ice_mass_trajectories and len(all_ice_mass_trajectories[-1]) > 0:
+                fitted["final_ice_mass_kg"] = float(all_ice_mass_trajectories[-1][-1])
+            
+            # Compute mean ice depletion rate from final segment
+            if len(all_ice_mass_trajectories) > 0 and len(all_ice_mass_trajectories[-1]) >= 2:
+                final_seg_ice = all_ice_mass_trajectories[-1]
+                final_seg_t = all_t_arrays[-1]
+                dt = final_seg_t[-1] - final_seg_t[0]
+                if dt > 0:
+                    depletion_rate = (final_seg_ice[0] - final_seg_ice[-1]) / dt
+                    fitted["ice_depletion_rate_kg_s"] = float(depletion_rate)
+            
+            # Track if extrapolation was used
+            threshold = 0.01 * initial_ice_mass
+            ice_depleted = False
+            for seg_ice in all_ice_mass_trajectories:
+                if any(im <= threshold for im in seg_ice):
+                    ice_depleted = True
+                    break
+            fitted["extrapolation_used"] = not ice_depleted
     else:
         # Legacy mode: independent segments
         for seg in segments:

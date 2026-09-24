@@ -35,6 +35,7 @@ from core_pipeline import (
 )
 
 from pikal_model import fit_parameters_joint, simulate_cycle, simulate_continuous_primary_drying
+from report_builders import build_mass_balance_lines
 
 
 app = Flask(__name__)
@@ -454,12 +455,28 @@ def run_pipeline():
             log(f"  Transition threshold: {diagnostics['threshold']:.3f} Pa", 'info')
             log(f"  Transition detected: {diagnostics['detected']}", 'info')
         
-        # Calculate endpoint as time from start of process (in seconds)
-        first_timestamp = df["timestamp"].min()
-        endpoint_time_from_start = None
-        if endpoint_ts is not None and pd.notna(first_timestamp):
-            endpoint_time_from_start = (endpoint_ts - first_timestamp).total_seconds()
-            log(f"  Endpoint time from start: {endpoint_time_from_start:.1f}s ({endpoint_time_from_start/60:.1f} min)", 'info')
+        # Calculate endpoint as time from start of primary drying (in seconds).
+        # Mass-balance closure requires this value; silently passing None is forbidden.
+        primary_df = df[df["Phase"] == phase_code]
+        if endpoint_ts is None or len(primary_df) == 0:
+            raise RuntimeError(
+                "Cannot compute endpoint_time_s: endpoint detection failed or no "
+                "primary-phase rows found. Passing None to the joint fit is "
+                "forbidden by the mass-balance closure requirement."
+            )
+        primary_start_timestamp = primary_df["timestamp"].min()
+        if pd.isna(primary_start_timestamp):
+            raise RuntimeError(
+                "Cannot compute endpoint_time_s: no valid primary-drying start "
+                "timestamp available."
+            )
+        endpoint_time_from_start = (endpoint_ts - primary_start_timestamp).total_seconds()
+        if endpoint_time_from_start <= 0:
+            raise RuntimeError(
+                f"Cannot compute endpoint_time_s: detected endpoint ({endpoint_ts}) "
+                f"is not after the start of primary drying ({primary_start_timestamp})."
+            )
+        log(f"  Endpoint time from start of primary drying: {endpoint_time_from_start:.1f}s ({endpoint_time_from_start/60:.1f} min)", 'info')
         
         # Build segments using centralized physics with variance-based steady-state detection
         log("\n[3/6] Building drying segments...", 'info')

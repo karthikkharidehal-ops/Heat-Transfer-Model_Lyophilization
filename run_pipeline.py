@@ -38,6 +38,7 @@ from core_pipeline import (
 )
 
 from pikal_model import fit_parameters_joint, simulate_cycle, simulate_continuous_primary_drying
+from report_builders import build_mass_balance_lines
 
 
 def main():
@@ -184,11 +185,28 @@ def main():
         endpoint_ts = endpoint_result
         endpoint_diagnostics = {}
     
-    # Calculate endpoint as time from start of process (in seconds)
-    first_timestamp = df["timestamp"].min()
-    endpoint_time_from_start = None
-    if endpoint_ts is not None and pd.notna(first_timestamp):
-        endpoint_time_from_start = (endpoint_ts - first_timestamp).total_seconds()
+    # Calculate endpoint as time from start of primary drying (in seconds).
+    # Mass-balance closure requires this value; silently passing None is forbidden.
+    primary_df = df[df["Phase"] == phase_code]
+    if len(primary_df) == 0:
+        raise SystemExit(
+            "[error] Cannot compute endpoint_time_s: no rows found for the primary "
+            f"drying phase (Phase == {phase_code!r})."
+        )
+    primary_start_timestamp = primary_df["timestamp"].min()
+    if endpoint_ts is None or pd.isna(endpoint_ts) or pd.isna(primary_start_timestamp):
+        raise SystemExit(
+            "[error] Cannot compute endpoint_time_s: endpoint detection failed "
+            "(no endpoint timestamp available). Passing None to the joint fit is "
+            "forbidden by the mass-balance closure requirement."
+        )
+    endpoint_time_from_start = (endpoint_ts - primary_start_timestamp).total_seconds()
+    if endpoint_time_from_start <= 0:
+        raise SystemExit(
+            "[error] Cannot compute endpoint_time_s: detected endpoint is not after "
+            "the start of primary drying "
+            f"(endpoint_ts={endpoint_ts}, primary_start={primary_start_timestamp})."
+        )
 
     # Build primary-drying segments (truncated at endpoint)
     segments = build_segments(
@@ -333,10 +351,7 @@ def main():
     lines.extend([
         "",
         "=== Mass-Balance Constraint ===",
-        f"Detected endpoint time: {endpoint_time_from_start:.1f} s" if endpoint_time_from_start is not None else "Detected endpoint time: N/A",
-        f"Simulated endpoint time: {fitted.get('simulated_endpoint_time_s', 'N/A'):.1f} s" if fitted.get('simulated_endpoint_time_s') is not None else "Simulated endpoint time: N/A",
-        f"Mass-balance residual: {fitted.get('mass_balance_residual', 'N/A'):.6f}" if fitted.get('mass_balance_residual') is not None else "Mass-balance residual: N/A (endpoint not provided)",
-    ])
+    ] + build_mass_balance_lines(fitted, endpoint_time_from_start))
     
     # Add detailed mass-balance physics if available
     if fitted.get('initial_ice_mass_kg') is not None:
@@ -349,6 +364,9 @@ def main():
             lines.append(f"Mean ice depletion rate (final segment): {fitted['ice_depletion_rate_kg_s']:.9e} kg/s")
         if fitted.get('extrapolation_used', False):
             lines.append("Note: Endpoint was extrapolated beyond simulated window using depletion rate.")
+    
+    lines.extend([
+        "",
         "Fitted parameters:",
         f"  Kv  = {fitted['Kv']:.6f}",
         f"  Rp0 = {fitted['Rp0']:.6f}",
