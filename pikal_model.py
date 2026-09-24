@@ -421,6 +421,9 @@ def fit_parameters_joint(
     _endpoint_time_s = endpoint_time_s
     _mass_balance_weight = mass_balance_weight
 
+    # Track whether the mass-balance penalty branch actually executed during the fit
+    _mass_balance_state = {"active": False}
+
     def compute_simulated_endpoint_time(ice_mass_trajectories: list[np.ndarray], 
                                          t_arrays: list[np.ndarray],
                                          initial_ice_mass: float) -> float:
@@ -508,7 +511,8 @@ def fit_parameters_joint(
                 simulated_endpoint = compute_simulated_endpoint_time(
                     all_ice_mass_trajectories, all_t_arrays, initial_ice_mass
                 )
-                
+                _mass_balance_state["active"] = True
+
                 # Normalized mass-balance residual
                 mass_residual = _mass_balance_weight * (simulated_endpoint - _endpoint_time_s) / _endpoint_time_s
                 out.append(np.array([mass_residual]))
@@ -534,6 +538,14 @@ def fit_parameters_joint(
     fitted["rms_error_k"] = float(np.sqrt(np.mean(fun_vals ** 2)))
     fitted["converged"] = bool(success)
 
+    # Mass-balance closure diagnostics (always present in the result dict).
+    # mass_balance_active is True only when endpoint_time_s was provided AND the
+    # penalty branch inside resid() actually executed during the fit.
+    fitted["detected_endpoint_time_s"] = endpoint_time_s if (endpoint_time_s is not None and endpoint_time_s > 0) else None
+    fitted["simulated_endpoint_time_s"] = None
+    fitted["mass_balance_residual"] = None
+    fitted["mass_balance_active"] = bool(_mass_balance_state["active"])
+
     # Calculate per-segment RMS errors and mass-balance diagnostics using continuous simulation
     per_segment = {}
     Kv, Rp0, A1, A2 = x_vals
@@ -556,6 +568,7 @@ def fit_parameters_joint(
                 all_ice_mass_trajectories, all_t_arrays, initial_ice_mass
             )
             fitted["simulated_endpoint_time_s"] = simulated_endpoint
+            fitted["detected_endpoint_time_s"] = endpoint_time_s
             fitted["mass_balance_residual"] = mass_balance_weight * (simulated_endpoint - endpoint_time_s) / endpoint_time_s
             
             # Store detailed mass-balance physics for reporting

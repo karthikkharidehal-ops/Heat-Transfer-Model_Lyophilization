@@ -35,6 +35,7 @@ from core_pipeline import (
 )
 
 from pikal_model import fit_parameters_joint, simulate_cycle, simulate_continuous_primary_drying
+from report_builders import build_mass_balance_lines
 
 
 class PipelineGUI:
@@ -311,15 +312,23 @@ class PipelineGUI:
                 self._log(f"  Transition threshold: {diagnostics['threshold']:.3f} Pa", 'info')
                 self._log(f"  Transition detected: {diagnostics['detected']}", 'info')
             
-            # Calculate endpoint time in seconds from start of primary drying
-            endpoint_time_s = None
-            if endpoint_ts is not None:
-                # Get first timestamp of primary phase for relative time calculation
-                primary_df = df[df["Phase"] == phase_code].copy()
-                if len(primary_df) > 0:
-                    first_timestamp = primary_df["timestamp"].min()
-                    endpoint_time_s = (endpoint_ts - first_timestamp).total_seconds()
-                    self._log(f"  Endpoint time from start of primary drying: {endpoint_time_s:.1f} s", 'info')
+            # Calculate endpoint time in seconds from start of primary drying.
+            # Mass-balance closure requires this value; silently passing None is forbidden.
+            primary_df = df[df["Phase"] == phase_code].copy()
+            if endpoint_ts is None or len(primary_df) == 0:
+                raise RuntimeError(
+                    "Cannot compute endpoint_time_s: endpoint detection failed or no "
+                    "primary-phase rows found. Passing None to the joint fit is "
+                    "forbidden by the mass-balance closure requirement."
+                )
+            first_timestamp = primary_df["timestamp"].min()
+            endpoint_time_s = (endpoint_ts - first_timestamp).total_seconds()
+            if endpoint_time_s <= 0:
+                raise RuntimeError(
+                    f"Cannot compute endpoint_time_s: detected endpoint ({endpoint_ts}) "
+                    f"is not after the start of primary drying ({first_timestamp})."
+                )
+            self._log(f"  Endpoint time from start of primary drying: {endpoint_time_s:.1f} s", 'info')
             
             # Build segments using centralized physics with variance-based steady-state detection
             self._log("\n[3/6] Building drying segments...")
@@ -362,7 +371,11 @@ class PipelineGUI:
             else:
                 self._log("  Fit converged successfully", 'success')
             
-            self._log(f"\nFitted parameters:")
+            # Log the mass-balance closure lines to the GUI log as well
+            for mb_line in build_mass_balance_lines(fitted, endpoint_time_s):
+                self._log(f"  {mb_line}")
+
+            self._log("\nFitted parameters:")
             self._log(f"  Kv  = {fitted['Kv']:.6f}")
             self._log(f"  Rp0 = {fitted['Rp0']:.6f}")
             self._log(f"  A1  = {fitted['A1']:.6f}")
@@ -408,9 +421,7 @@ class PipelineGUI:
                 f"Transition detected: {diagnostics.get('detected', False)}",
                 "",
                 "=== Mass-Balance Constraint ===",
-                f"Detected endpoint time: {endpoint_time_s:.1f} s" if endpoint_time_s is not None else "Detected endpoint time: N/A",
-                f"Simulated endpoint time: {fitted.get('simulated_endpoint_time_s', 'N/A'):.1f} s" if fitted.get('simulated_endpoint_time_s') is not None else "Simulated endpoint time: N/A",
-                f"Mass-balance residual: {fitted.get('mass_balance_residual', 'N/A'):.6f}" if fitted.get('mass_balance_residual') is not None else "Mass-balance residual: N/A (endpoint not provided)",
+            ] + build_mass_balance_lines(fitted, endpoint_time_s) + [
                 "",
                 "Fitted parameters:",
                 f"  Kv  = {fitted['Kv']:.6f}",
