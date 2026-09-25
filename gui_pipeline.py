@@ -363,7 +363,7 @@ class PipelineGUI:
                 use_transient=use_transient_final,
                 use_hybrid=use_hybrid,
                 endpoint_time_s=endpoint_time_s,
-                mass_balance_weight=1.0
+                mass_balance_weight=None
             )
             
             if not fitted['converged']:
