@@ -71,3 +71,72 @@ def build_mass_balance_section(fitted: dict, detected_endpoint_time_s: Optional[
     lines = ["=== Mass-Balance Constraint ==="]
     lines.extend(build_mass_balance_lines(fitted, detected_endpoint_time_s))
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Anchored-geometry reporting (E-GEOM-ANCHOR-001 / E-PHYS-GEOM-ANCHOR-001)
+# ---------------------------------------------------------------------------
+
+def build_geometry_lines(tube, profile: str) -> list[str]:
+    """Active area-profile line plus the h vs V(h) vs A(h) table.
+
+    Table runs from 0 to H in 0.5 mm steps. Single source of truth for
+    BOTH GUIs and the CLI report (no duplicated report logic).
+    """
+    from geometry import build_geometry_table_rows
+
+    lines = [
+        "=== Anchored Geometry (E-GEOM-ANCHOR-001) ===",
+        f"Geometry profile: {profile}",
+        "Measured anchor: 16.0 uL = 4.0 mm fill height (fill height fixed at 4.0 mm; "
+        "multi-point calibration DEFERRED - mandatory before recipe optimization or advisory MPC)",
+        "",
+        "h vs V(h) vs A(h) (0 to H in 0.5 mm steps):",
+        f"  {'h (mm)':>8} | {'V(h) (uL)':>12} | {'A(h) (mm^2)':>12}",
+        f"  {'-' * 8}-+-{'-' * 12}-+-{'-' * 12}",
+    ]
+    for h_m, v_m3, a_m2 in build_geometry_table_rows(tube, h_step_m=0.5e-3):
+        lines.append(f"  {h_m * 1e3:8.2f} | {v_m3 * 1e9:12.6f} | {a_m2 * 1e6:12.6f}")
+    return lines
+
+
+def build_residual_diagnostics_lines(fitted: dict) -> list[str]:
+    """Per-segment residual sign (simulated minus measured) statistics and
+    median probe spread (max minus min across TP01..TP04 probes).
+
+    Reads ``fitted['per_segment_diagnostics']`` produced by
+    ``pikal_model.fit_parameters_joint``. Shared by both GUIs and the CLI.
+    """
+    diags = fitted.get("per_segment_diagnostics") or {}
+    if not diags:
+        return []
+    lines = ["", "=== Per-Segment Residual Diagnostics (simulated - measured) ==="]
+    for label, d in diags.items():
+        mean_sign = _sign_word(d.get("mean_residual_k"))
+        median_sign = _sign_word(d.get("median_residual_k"))
+        lines.append(f"  {label}:")
+        if d.get("mean_residual_k") is not None:
+            lines.append(f"    Mean residual: {d['mean_residual_k']:+.6f} K ({mean_sign})")
+        if d.get("median_residual_k") is not None:
+            lines.append(f"    Median residual: {d['median_residual_k']:+.6f} K ({median_sign})")
+        if d.get("residual_sign") is not None:
+            lines.append(f"    Residual sign (median): {d['residual_sign']}")
+        if d.get("median_probe_spread_k") is not None:
+            lines.append(
+                f"    Median probe spread (max-min of TP01..TP04): "
+                f"{d['median_probe_spread_k']:.6f} K"
+            )
+        else:
+            lines.append("    Median probe spread (max-min of TP01..TP04): unavailable (probe columns missing)")
+    return lines
+
+
+def _sign_word(value: Optional[float]) -> str:
+    """Return 'positive' / 'negative' / 'zero-ish' for a residual statistic."""
+    if value is None:
+        return "unknown"
+    if value > 0:
+        return "positive"
+    if value < 0:
+        return "negative"
+    return "zero"

@@ -669,6 +669,21 @@ def build_segments(
             rows_kept = len(group)
             print(f"[DIAG] cycle={cycle_id}_step={step_id}: kept {rows_kept}/{rows_kept_before_truncation} rows (dropped {rows_dropped_endpoint} rows due to endpoint truncation)")
 
+        # Probe spread diagnostics: max minus min across TP01..TP04 at each
+        # timestep; the segment reports its MEDIAN spread (E-PHYS-GEOM-ANCHOR-001).
+        probe_k_cols = [c for c in ("tp01_k", "tp02_k", "tp03_k", "tp04_k")
+                        if c in group.columns]
+        if not probe_k_cols:
+            # tolerate alternate historian naming (TP1..TP4 -> tp1_k..tp4_k)
+            probe_k_cols = [c for c in ("tp1_k", "tp2_k", "tp3_k", "tp4_k")
+                            if c in group.columns]
+        median_probe_spread_k = None
+        if len(probe_k_cols) >= 2:
+            spread = group[probe_k_cols].max(axis=1) - group[probe_k_cols].min(axis=1)
+            spread = spread.dropna()
+            if len(spread) > 0:
+                median_probe_spread_k = float(spread.median())
+
         segments.append(
             DryingSegment(
                 t_s=t_s,
@@ -681,6 +696,7 @@ def build_segments(
                 is_hold_step=is_hold_step,
                 _shelf_temp_std=shelf_temp_std,
                 _pressure_std=pressure_std,
+                _median_probe_spread_k=median_probe_spread_k,
             )
         )
 

@@ -5,7 +5,7 @@ Pikal primary-drying model for tapered PCR-tube geometry.
 from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import brentq, least_squares
-from geometry import PCRTubeGeometry
+from geometry import PCRTubeGeometry, AnchoredTubeGeometry
 
 DH_S = 2.838e6      # J/kg, latent heat of ice sublimation
 RHO_ICE = 918.0     # kg/m^3
@@ -137,22 +137,33 @@ def simulate_cycle(
     Tp_sim = np.zeros(n)
     fill_height = tube.fill_height(fill_volume_m3)
     contact_area = tube.contact_area_m2(fill_height)
-    L = 0.0  # dried-layer thickness from the top, meters
-    
+    L = 0.0  # UNIFIED STATE VARIABLE: dried-layer thickness from the top (m).
+             # Ice mass is DERIVED from L (never accumulated independently):
+             #   ice_mass = rho_ice * (V(H) - V(H - L))
+
+    def _derived_ice_mass() -> float:
+        """Ice mass (kg) consistent with the current front depth L."""
+        if isinstance(tube, AnchoredTubeGeometry):
+            return tube.derived_ice_mass_kg(L, RHO_ICE)
+        # Legacy frustum fallback: remaining column volume below the front.
+        remaining_h = max(fill_height - L, 0.0)
+        r_bot = tube.bottom_radius_m
+        r_top = tube.radius_at_height(remaining_h)
+        v_remaining = (np.pi * remaining_h / 3.0) * (r_bot ** 2 + r_bot * r_top + r_top ** 2)
+        return float(RHO_ICE * v_remaining)
+
     # Initialize for transient mode
     if use_transient:
-        initial_ice_volume = fill_volume_m3  # Start with full ice volume
-        initial_ice_mass = RHO_ICE * initial_ice_volume
-        ice_mass = initial_ice_mass
+        ice_mass = _derived_ice_mass()  # DERIVED from L, not an independent state
         Tp_prev = Ts_k[0] - 5.0  # Initial guess for product temp
     else:
         ice_mass = None
         Tp_prev = None
-    
+
     for i in range(n):
         Rp = Rp0 + A1 * L / (1.0 + A2 * L)
         A_front = tube.front_area_m2(fill_height, L)
-        
+
         if use_transient and i > 0:
             dt = float(t_s[i] - t_s[i - 1])
             flux, Tp_k = solve_Tp(
@@ -160,23 +171,26 @@ def simulate_cycle(
                 float(contact_area), float(A_front), float(Kv),
                 Tp_prev_k=float(Tp_prev), dt=dt, ice_mass=float(ice_mass)
             )
-            # Update ice mass based on sublimation
-            dmdt_total = flux * A_front
-            ice_mass -= max(dmdt_total * dt, 0.0)
-            ice_mass = max(ice_mass, 0.0)  # Can't go negative
             Tp_prev = Tp_k
         else:
             flux, Tp_k = solve_Tp(
                 float(Ts_k[i]), float(Pc_pa[i]), float(Rp), float(Rs),
                 float(contact_area), float(A_front), float(Kv)
             )
-        
+
         Tp_sim[i] = Tp_k
 
         if i < n - 1:
             dt = float(t_s[i + 1] - t_s[i])
-            L += max(flux / RHO_ICE, 0.0) * dt
+            # The dried layer grows by the sublimed ice volume divided by the
+            # LOCAL front area A(front height) — exactly conserving ice mass:
+            # after the step, rho_ice * (V(H) - V(H - L_new)) equals the old
+            # derived mass minus flux*A_front*dt.
+            if A_front > 0.0:
+                L += max(flux * dt / RHO_ICE, 0.0) / A_front
             L = min(L, fill_height)  # front can't pass the tube bottom
+            if use_transient:
+                ice_mass = _derived_ice_mass()  # re-DERIVE, never accumulate
 
     return Tp_sim
 
@@ -242,6 +256,7 @@ class DryingSegment:
     is_hold_step: bool = True  # Default to hold step (steady-state)
     _shelf_temp_std: float = 0.0  # Measured shelf temperature std dev (K) for reporting
     _pressure_std: float = 0.0  # Measured pressure std dev (Pa) for reporting
+    _median_probe_spread_k: float | None = None  # Median (max-min of TP01..TP04) probe spread (K)
 
 
 def simulate_continuous_primary_drying(
@@ -278,53 +293,70 @@ def simulate_continuous_primary_drying(
     t_arrays : list[np.ndarray]
         List of time arrays (seconds from segment start), one per segment
     ice_mass_trajectories : list[np.ndarray]
-        List of ice mass trajectories (kg), one per segment
+        List of ice mass trajectories (kg), one per segment. These are
+        DERIVED from the unified state L at each timestep — never an
+        independently accumulated quantity.
+    front_depth_trajectories : list[np.ndarray]
+        List of dried-layer depth L(t) (m), one per segment. The simulated
+        endpoint is defined on this trajectory: first time L >= H.
     """
     # Initialize state variables at the start of primary drying
     # These will be carried forward across all segments
-    L = 0.0  # Dried layer thickness from top (m)
+    L = 0.0  # UNIFIED STATE VARIABLE: dried layer thickness from top (m)
     tube = segments[0].tube
     fill_volume_m3 = segments[0].fill_volume_m3
     fill_height = tube.fill_height(fill_volume_m3)
     contact_area = tube.contact_area_m2(fill_height)
-    
-    # Initialize ice mass (full ice volume at start of primary drying)
-    initial_ice_volume = fill_volume_m3
-    initial_ice_mass = RHO_ICE * initial_ice_volume
-    ice_mass = initial_ice_mass
-    
+
+    def _derived_ice_mass(L_now: float) -> float:
+        """Ice mass (kg) DERIVED from the front depth L: rho*(V(H)-V(H-L))."""
+        if isinstance(tube, AnchoredTubeGeometry):
+            return tube.derived_ice_mass_kg(L_now, RHO_ICE)
+        remaining_h = max(fill_height - L_now, 0.0)
+        r_bot = tube.bottom_radius_m
+        r_top = tube.radius_at_height(remaining_h)
+        v_remaining = (np.pi * remaining_h / 3.0) * (r_bot ** 2 + r_bot * r_top + r_top ** 2)
+        return float(RHO_ICE * v_remaining)
+
+    initial_ice_mass = _derived_ice_mass(0.0)
+    ice_mass = initial_ice_mass  # derived, not an independent state
+
     # Initial product temperature guess
     Tp_prev = segments[0].Ts_k[0] - 5.0  # Start ~5K below shelf temp
-    
+
     all_Tp_sim = []
     all_t_arrays = []
     all_ice_mass_trajectories = []
-    
+    all_L_trajectories = []
+
     for seg_idx, seg in enumerate(segments):
         n = len(seg.t_s)
         Tp_sim = np.zeros(n)
-        ice_mass_trajectory = np.zeros(n)  # Track ice mass over this segment
-        
+        ice_mass_trajectory = np.zeros(n)  # derived from L at each timestep
+        L_trajectory = np.zeros(n)
+
         # Debug print for state continuity verification
         print(f"[STATE-CONTINUITY] Segment {seg_idx} ({seg.label}): L_start = {L:.6f} m, ice_mass = {ice_mass:.9f} kg")
-        
+
         # Determine physics mode for this segment
         seg_use_transient = True  # Default to transient for continuity
         if use_hybrid:
-            # Hold steps: steady-state (but still continue L and ice_mass)
+            # Hold steps: steady-state (but still continue L and derived ice_mass)
             # Ramp steps: transient
             seg_use_transient = not seg.is_hold_step
-        
+
         for i in range(n):
             # Calculate product resistance based on current dried layer thickness
             Rp = Rp0 + A1 * L / (1.0 + A2 * L)
-            
+
             # Calculate front area based on current front position
             A_front = tube.front_area_m2(fill_height, L)
-            
-            # Record ice mass at this timestep
+
+            # Record DERIVED ice mass at this timestep
+            ice_mass = _derived_ice_mass(L)
             ice_mass_trajectory[i] = ice_mass
-            
+            L_trajectory[i] = L
+
             if seg_use_transient and i > 0:
                 # Transient mode: include heat accumulation term
                 dt = float(seg.t_s[i] - seg.t_s[i - 1])
@@ -333,39 +365,37 @@ def simulate_continuous_primary_drying(
                     float(contact_area), float(A_front), float(Kv),
                     Tp_prev_k=float(Tp_prev), dt=dt, ice_mass=float(ice_mass)
                 )
-                # Update ice mass based on sublimation
-                dmdt_total = flux * A_front
-                ice_mass -= max(dmdt_total * dt, 0.0)
-                ice_mass = max(ice_mass, 0.0)  # Can't go negative
                 Tp_prev = Tp_k
             else:
                 # Steady-state mode (for Hold steps in hybrid mode)
-                # Still uses current L and ice_mass from previous segments
+                # Still uses current L (and the ice mass derived from it)
                 flux, Tp_k = solve_Tp(
                     float(seg.Ts_k[i]), float(seg.Pc_pa[i]), float(Rp), float(Rs),
                     float(contact_area), float(A_front), float(Kv)
                 )
-                # For steady-state, we still track ice mass but don't use accumulation term
-                dmdt_total = flux * A_front
-                if i > 0:
-                    dt = float(seg.t_s[i] - seg.t_s[i - 1])
-                    ice_mass -= max(dmdt_total * dt, 0.0)
-                    ice_mass = max(ice_mass, 0.0)
                 Tp_prev = Tp_k  # Still update for continuity
-            
+
             Tp_sim[i] = Tp_k
 
-            # Update dried layer thickness for next timestep
+            # Update the unified state variable L for the next timestep.
+            # Volume sublimed over dt divided by the LOCAL front area keeps
+            # ice_mass == rho*(V(H)-V(H-L)) exactly consistent (no separate
+            # ice-mass accumulation exists anywhere).
             if i < n - 1:
                 dt = float(seg.t_s[i + 1] - seg.t_s[i])
-                L += max(flux / RHO_ICE, 0.0) * dt
-                L = min(L, fill_height)  # Front can't pass tube bottom
-        
+                if A_front > 0.0:
+                    L += max(flux * dt / RHO_ICE, 0.0) / A_front
+                # L may reach/exceed H (= fill height): that IS the simulated
+                # endpoint. No hard clamp so L >= H remains detectable; cap at
+                # 2H purely as a numerical guard against runaway growth.
+                L = min(L, 2.0 * fill_height)
+
         all_Tp_sim.append(Tp_sim)
         all_t_arrays.append(seg.t_s.copy())
         all_ice_mass_trajectories.append(ice_mass_trajectory)
-    
-    return all_Tp_sim, all_t_arrays, all_ice_mass_trajectories
+        all_L_trajectories.append(L_trajectory)
+
+    return all_Tp_sim, all_t_arrays, all_ice_mass_trajectories, all_L_trajectories
 
 
 def fit_parameters_joint(
@@ -431,73 +461,36 @@ def fit_parameters_joint(
     # Track whether the mass-balance penalty branch actually executed during the fit
     _mass_balance_state = {"active": False, "weight_used": None}
 
-    def compute_simulated_endpoint_time(ice_mass_trajectories: list[np.ndarray], 
-                                         t_arrays: list[np.ndarray],
-                                         initial_ice_mass: float) -> float:
-        """Compute simulated endpoint time from ice mass trajectories.
-        
-        Endpoint is defined as first time ice_mass <= 1% of initial ice mass.
-        If ice never depletes within simulated window, extrapolate using mean
-        depletion rate of final segment.
-        
+    def compute_simulated_endpoint_time(front_depth_trajectories: list[np.ndarray],
+                                        t_arrays: list[np.ndarray]) -> float | None:
+        """Compute simulated endpoint time from the unified front-depth state L.
+
+        SIMULATED ENDPOINT = first time L >= H (the measured 4.0 mm fill
+        height). There is NO extrapolation fallback: if L never reaches H
+        within the simulated window, this returns None and the caller must
+        report the endpoint as not reached.
+
         Parameters
         ----------
-        ice_mass_trajectories : list[np.ndarray]
-            Ice mass trajectory for each segment
+        front_depth_trajectories : list[np.ndarray]
+            Dried-layer depth L(t) (m) for each segment
         t_arrays : list[np.ndarray]
             Time arrays for each segment (seconds from segment start)
-        initial_ice_mass : float
-            Initial ice mass at start of primary drying
-            
+
         Returns
         -------
-        simulated_endpoint_time_s : float
-            Simulated endpoint time in seconds from start of primary drying
+        simulated_endpoint_time_s : float | None
+            First time (seconds from start of primary drying) with L >= H,
+            or None if the front never fully recedes within the window.
         """
-        # Concatenate all segments to get continuous timeline
         cumulative_time = 0.0
-        all_times = []
-        all_ice_masses = []
-        
-        for seg_idx, (t_arr, ice_traj) in enumerate(zip(t_arrays, ice_mass_trajectories)):
+        for t_arr, L_traj in zip(t_arrays, front_depth_trajectories):
             for i in range(len(t_arr)):
-                all_times.append(cumulative_time + t_arr[i])
-                all_ice_masses.append(ice_traj[i])
+                if L_traj[i] >= fill_height:
+                    return cumulative_time + float(t_arr[i])
             if len(t_arr) > 0:
-                cumulative_time += t_arr[-1]
-        
-        threshold = 0.01 * initial_ice_mass
-        
-        # Find first time ice_mass <= 1% of initial
-        for i, im in enumerate(all_ice_masses):
-            if im <= threshold:
-                return all_times[i]
-        
-        # Ice never depleted within simulated window - extrapolate
-        # Use mean depletion rate of final segment
-        if len(all_ice_masses) >= 2:
-            final_im = all_ice_masses[-1]
-            final_t = all_times[-1]
-            
-            # Get depletion rate from last few points of final segment
-            n_final = min(5, len(all_ice_masses))
-            if n_final >= 2:
-                im_final_segment = all_ice_masses[-n_final:]
-                t_final_segment = all_times[-n_final:]
-                
-                # Mean depletion rate (kg/s)
-                dt = t_final_segment[-1] - t_final_segment[0]
-                if dt > 0:
-                    depletion_rate = (im_final_segment[0] - im_final_segment[-1]) / dt
-                    
-                    if depletion_rate > 0:
-                        # Extrapolate time to reach threshold
-                        remaining_ice = final_im - threshold
-                        time_to_deplete = remaining_ice / depletion_rate
-                        return final_t + time_to_deplete
-        
-        # Fallback: return end of simulated window
-        return all_times[-1] if all_times else 0.0
+                cumulative_time += float(t_arr[-1])
+        return None  # endpoint NOT reached — no extrapolation fallback
 
     def resid(x: np.ndarray) -> np.ndarray:
         Kv, Rp0, A1, A2 = x
