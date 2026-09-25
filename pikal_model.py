@@ -188,11 +188,38 @@ def simulate_cycle(
             # derived mass minus flux*A_front*dt.
             if A_front > 0.0:
                 L += max(flux * dt / RHO_ICE, 0.0) / A_front
-            L = min(L, fill_height)  # front can't pass the tube bottom
+            # Do NOT clamp L at H: the simulated endpoint is defined as the
+            # first time L >= H, so that crossing must remain detectable.
+            # Cap at 2H purely as a numerical guard against runaway growth.
+            L = min(L, 2.0 * fill_height)
             if use_transient:
                 ice_mass = _derived_ice_mass()  # re-DERIVE, never accumulate
 
     return Tp_sim
+
+
+def _first_endpoint_time_s(
+    L_trajectories: list[np.ndarray],
+    t_arrays: list[np.ndarray],
+    H_m: float,
+) -> float | None:
+    """Simulated endpoint = FIRST time the dried-layer depth L reaches/exceeds
+    the total ice-column height H (the measured 4.0 mm anchor in anchored mode).
+
+    NO extrapolation fallback exists: if L < H throughout the entire simulated
+    window this returns None and callers must report the endpoint as
+    "not reached within the simulated window".
+    """
+    cumulative = 0.0
+    for t_arr, L_traj in zip(t_arrays, L_trajectories):
+        if len(L_traj) == 0:
+            continue
+        hit = np.where(np.asarray(L_traj) >= H_m)[0]
+        if hit.size:
+            return cumulative + float(t_arr[int(hit[0])])
+        if len(t_arr) > 0:
+            cumulative += float(t_arr[-1])
+    return None
 
 
 def fit_parameters(
@@ -305,6 +332,9 @@ def simulate_continuous_primary_drying(
     L = 0.0  # UNIFIED STATE VARIABLE: dried layer thickness from top (m)
     tube = segments[0].tube
     fill_volume_m3 = segments[0].fill_volume_m3
+    # H: total ice-column height at the start of primary drying. For the
+    # anchored geometry this is the measured anchor height (4.0 mm); the
+    # simulated endpoint is defined as the first time L >= H.
     fill_height = tube.fill_height(fill_volume_m3)
     contact_area = tube.contact_area_m2(fill_height)
 
@@ -461,44 +491,29 @@ def fit_parameters_joint(
     # Track whether the mass-balance penalty branch actually executed during the fit
     _mass_balance_state = {"active": False, "weight_used": None}
 
+    # H: total ice-column height at start of primary drying. In anchored mode
+    # this is the measured 4.0 mm anchor (fill_height() is pinned to it).
+    _H_m = segments[0].tube.fill_height(segments[0].fill_volume_m3)
+
     def compute_simulated_endpoint_time(front_depth_trajectories: list[np.ndarray],
                                         t_arrays: list[np.ndarray]) -> float | None:
         """Compute simulated endpoint time from the unified front-depth state L.
 
-        SIMULATED ENDPOINT = first time L >= H (the measured 4.0 mm fill
-        height). There is NO extrapolation fallback: if L never reaches H
-        within the simulated window, this returns None and the caller must
-        report the endpoint as not reached.
-
-        Parameters
-        ----------
-        front_depth_trajectories : list[np.ndarray]
-            Dried-layer depth L(t) (m) for each segment
-        t_arrays : list[np.ndarray]
-            Time arrays for each segment (seconds from segment start)
-
-        Returns
-        -------
-        simulated_endpoint_time_s : float | None
-            First time (seconds from start of primary drying) with L >= H,
-            or None if the front never fully recedes within the window.
+        Delegates to _first_endpoint_time_s: SIMULATED ENDPOINT = first time
+        L >= H (the measured 4.0 mm fill height in anchored mode). There is
+        NO extrapolation fallback: if L never reaches H within the simulated
+        window this returns None and callers must report "not reached".
         """
-        cumulative_time = 0.0
-        for t_arr, L_traj in zip(t_arrays, front_depth_trajectories):
-            for i in range(len(t_arr)):
-                if L_traj[i] >= fill_height:
-                    return cumulative_time + float(t_arr[i])
-            if len(t_arr) > 0:
-                cumulative_time += float(t_arr[-1])
-        return None  # endpoint NOT reached — no extrapolation fallback
+        return _first_endpoint_time_s(front_depth_trajectories, t_arrays, _H_m)
 
     def resid(x: np.ndarray) -> np.ndarray:
         Kv, Rp0, A1, A2 = x
         # Use continuous simulation across all segments
         if use_transient or use_hybrid:
-            all_Tp_sim, all_t_arrays, all_ice_mass_trajectories = simulate_continuous_primary_drying(
-                segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
-            )
+            all_Tp_sim, all_t_arrays, all_ice_mass_trajectories, all_L_trajectories = \
+                simulate_continuous_primary_drying(
+                    segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
+                )
             out = [all_Tp_sim[i] - segments[i].Tp_measured_k for i in range(len(segments))]
 
             # Number of temperature residuals across all concatenated segments.
@@ -506,14 +521,6 @@ def fit_parameters_joint(
 
             # Add mass-balance residual if endpoint_time_s is provided
             if _endpoint_time_s is not None and _endpoint_time_s > 0:
-                # Calculate initial ice mass from first segment
-                tube = segments[0].tube
-                fill_volume_m3 = segments[0].fill_volume_m3
-                initial_ice_mass = RHO_ICE * fill_volume_m3
-                
-                simulated_endpoint = compute_simulated_endpoint_time(
-                    all_ice_mass_trajectories, all_t_arrays, initial_ice_mass
-                )
                 _mass_balance_state["active"] = True
 
                 # AUTO weight scaling: when mass_balance_weight is None, scale the
@@ -525,6 +532,20 @@ def fit_parameters_joint(
                 if effective_weight is None:
                     effective_weight = float(np.sqrt(max(n_temperature_residuals, 1)))
                 _mass_balance_state["weight_used"] = effective_weight
+
+                # Simulated endpoint = first time L >= H. If the front never
+                # fully recedes within the simulated window there is NO
+                # extrapolation fallback: the constraint penalizes the full
+                # remaining simulated window instead (endpoint treated as
+                # occurring no earlier than the end of the window).
+                simulated_endpoint = compute_simulated_endpoint_time(
+                    all_L_trajectories, all_t_arrays
+                )
+                if simulated_endpoint is None:
+                    total_window_s = sum(
+                        float(t_arr[-1]) for t_arr in all_t_arrays if len(t_arr) > 0
+                    )
+                    simulated_endpoint = total_window_s
 
                 # Normalized mass-balance residual
                 mass_residual = effective_weight * (simulated_endpoint - _endpoint_time_s) / _endpoint_time_s
@@ -560,27 +581,55 @@ def fit_parameters_joint(
     fitted["mass_balance_active"] = bool(_mass_balance_state["active"])
     fitted["mass_balance_penalty_share"] = None
 
-    # Calculate per-segment RMS errors and mass-balance diagnostics using continuous simulation
+    # Calculate per-segment RMS errors, residual-sign / probe-spread
+    # diagnostics, and mass-balance diagnostics using continuous simulation.
     per_segment = {}
+    per_segment_diagnostics: dict[str, dict] = {}
     Kv, Rp0, A1, A2 = x_vals
+
+    def _fill_residual_diags(label: str, resid_arr: np.ndarray, seg) -> None:
+        """Record mean/median residual sign (simulated minus measured) and the
+        median probe spread (max-min of TP01..TP04) for one segment."""
+        mean_r = float(np.mean(resid_arr))
+        median_r = float(np.median(resid_arr))
+        per_segment_diagnostics[label] = {
+            "mean_residual_k": mean_r,
+            "median_residual_k": median_r,
+            "residual_sign": (
+                "positive" if median_r > 0 else
+                "negative" if median_r < 0 else "zero"
+            ),
+            "median_probe_spread_k": getattr(seg, "_median_probe_spread_k", None),
+        }
+
     if use_transient or use_hybrid:
-        all_Tp_sim, all_t_arrays, all_ice_mass_trajectories = simulate_continuous_primary_drying(
-            segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
-        )
-        for i, seg in enumerate(segments):
-            per_segment[seg.label or f"segment_{id(seg)}"] = float(
-                np.sqrt(np.mean((all_Tp_sim[i] - seg.Tp_measured_k) ** 2))
+        all_Tp_sim, all_t_arrays, all_ice_mass_trajectories, all_L_trajectories = \
+            simulate_continuous_primary_drying(
+                segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
             )
-        
+        for i, seg in enumerate(segments):
+            label = seg.label or f"segment_{id(seg)}"
+            resid_i = all_Tp_sim[i] - seg.Tp_measured_k
+            per_segment[label] = float(np.sqrt(np.mean(resid_i ** 2)))
+            _fill_residual_diags(label, resid_i, seg)
+
         # Compute mass-balance diagnostics if endpoint was provided
         if endpoint_time_s is not None and endpoint_time_s > 0:
             tube = segments[0].tube
             fill_volume_m3 = segments[0].fill_volume_m3
-            initial_ice_mass = RHO_ICE * fill_volume_m3
-            
+            # Initial ice mass DERIVED from the anchored geometry when
+            # available: rho * V(H); legacy fallback keeps rho * fill volume.
+            if isinstance(tube, AnchoredTubeGeometry):
+                initial_ice_mass = tube.derived_ice_mass_kg(0.0, RHO_ICE)
+            else:
+                initial_ice_mass = RHO_ICE * fill_volume_m3
+
+            # Simulated endpoint = first time L >= H. NO extrapolation
+            # fallback: if never reached within the window, report None.
             simulated_endpoint = compute_simulated_endpoint_time(
-                all_ice_mass_trajectories, all_t_arrays, initial_ice_mass
+                all_L_trajectories, all_t_arrays
             )
+            fitted["endpoint_reached_in_window"] = simulated_endpoint is not None
 
             # Resolve the effective penalty weight at the final parameters.
             # mass_balance_weight=None means AUTO: sqrt(N_temperature_residuals),
@@ -592,7 +641,14 @@ def fit_parameters_joint(
             if _mass_balance_state.get("weight_used") is not None:
                 effective_weight = float(_mass_balance_state["weight_used"])
 
-            mass_residual_final = effective_weight * (simulated_endpoint - endpoint_time_s) / endpoint_time_s
+            endpoint_for_residual = simulated_endpoint
+            if endpoint_for_residual is None:
+                # Endpoint NOT reached: no extrapolation. Penalize against the
+                # end of the simulated window (a strict lower bound).
+                endpoint_for_residual = sum(
+                    float(t_arr[-1]) for t_arr in all_t_arrays if len(t_arr) > 0
+                )
+            mass_residual_final = effective_weight * (endpoint_for_residual - endpoint_time_s) / endpoint_time_s
 
             fitted["simulated_endpoint_time_s"] = simulated_endpoint
             fitted["detected_endpoint_time_s"] = endpoint_time_s
@@ -617,14 +673,14 @@ def fit_parameters_joint(
             fitted["mass_balance_penalty_share"] = (
                 float(mass_term_for_ss ** 2 / total_ss) if total_ss > 0 else 0.0
             )
-            
+
             # Store detailed mass-balance physics for reporting
             fitted["initial_ice_mass_kg"] = initial_ice_mass
-            
-            # Get final ice mass from end of last segment
+
+            # Get final ice mass from end of last segment (DERIVED trajectory)
             if all_ice_mass_trajectories and len(all_ice_mass_trajectories[-1]) > 0:
                 fitted["final_ice_mass_kg"] = float(all_ice_mass_trajectories[-1][-1])
-            
+
             # Compute mean ice depletion rate from final segment
             if len(all_ice_mass_trajectories) > 0 and len(all_ice_mass_trajectories[-1]) >= 2:
                 final_seg_ice = all_ice_mass_trajectories[-1]
@@ -633,15 +689,6 @@ def fit_parameters_joint(
                 if dt > 0:
                     depletion_rate = (final_seg_ice[0] - final_seg_ice[-1]) / dt
                     fitted["ice_depletion_rate_kg_s"] = float(depletion_rate)
-            
-            # Track if extrapolation was used
-            threshold = 0.01 * initial_ice_mass
-            ice_depleted = False
-            for seg_ice in all_ice_mass_trajectories:
-                if any(im <= threshold for im in seg_ice):
-                    ice_depleted = True
-                    break
-            fitted["extrapolation_used"] = not ice_depleted
     else:
         # Legacy mode: independent segments
         for seg in segments:
@@ -649,11 +696,13 @@ def fit_parameters_joint(
                 seg.t_s, seg.Ts_k, seg.Pc_pa, seg.tube,
                 seg.fill_volume_m3, Kv, Rp0, A1, A2, use_transient=False
             )
-            per_segment[seg.label or f"segment_{id(seg)}"] = float(
-                np.sqrt(np.mean((Tp_sim - seg.Tp_measured_k) ** 2))
-            )
-        
+            label = seg.label or f"segment_{id(seg)}"
+            resid_i = Tp_sim - seg.Tp_measured_k
+            per_segment[label] = float(np.sqrt(np.mean(resid_i ** 2)))
+            _fill_residual_diags(label, resid_i, seg)
+
     fitted["per_segment_rms_k"] = per_segment
+    fitted["per_segment_diagnostics"] = per_segment_diagnostics
     return fitted
 
 if __name__ == "__main__":
