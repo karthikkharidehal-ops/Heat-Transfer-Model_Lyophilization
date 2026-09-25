@@ -37,6 +37,111 @@ from core_pipeline import (
 from pikal_model import fit_parameters_joint, simulate_cycle, simulate_continuous_primary_drying
 from report_builders import build_mass_balance_lines
 
+# --- Single measured anchor (event E-GEOM-ANCHOR-001) -----------------------
+# Anchored geometry is the DEFAULT and ONLY trusted mode for this batch:
+#   16.0 uL  <->  4.0 mm fill height in production PCR tubes.
+# The area profile A(h) is an explicit, selectable assumption:
+#   cone_tip | scaled_frustum   (default: cone_tip)
+# Multi-point calibration (--calib / "Calibration Points") is DEFERRED
+# (open assumption A-GEOM-004): it is ignored in anchored mode with a loud
+# warning, and is MANDATORY before any recipe optimization or advisory MPC.
+from geometry import (
+    ANCHOR_FILL_VOLUME_UL,
+    ANCHOR_FILL_HEIGHT_MM,
+    GEOMETRY_PROFILES,
+    AnchoredTubeGeometry,
+    make_anchored_tube,
+    build_geometry_table_rows,
+)
+
+# Sensitivity sweep values shared with sensitivity_contact_area.py
+try:
+    from sensitivity_contact_area import CONTACT_EFFICIENCY_VALUES
+except Exception:  # pragma: no cover - optional dependency path
+    CONTACT_EFFICIENCY_VALUES = [0.05, 0.10, 0.15, 0.22, 0.30, 0.50, 0.75, 1.00]
+
+
+def _anchored_sensitivity_fit(
+    input_path,
+    primary_phase_code,
+    fill_volume_ul: float,
+    contact_efficiencies,
+    geometry_profile: str,
+    use_min_temp: bool,
+    use_transient: bool,
+    use_hybrid: bool,
+):
+    """Contact-efficiency sensitivity sweep using the ANCHORED geometry.
+
+    Mirrors sensitivity_contact_area.run_sensitivity_analysis() but rebuilds
+    an AnchoredTubeGeometry per contact efficiency (the legacy module still
+    uses CalibratedPCRTubeGeometry, which contradicts E-GEOM-ANCHOR-001).
+    Returns a pandas DataFrame of results.
+    """
+    df = load_raw(input_path)
+    df = build_timestamp(df)
+    df = normalize_units(df)
+    df = flag_primary_drying_end(df)
+
+    pressure_col = choose_pressure_column(df)
+    product_temp_col = choose_product_temperature_column(df, use_min=use_min_temp)
+    phase_code = coerce_phase_code(df, primary_phase_code)
+    fill_volume_m3 = fill_volume_ul * 1e-9
+
+    endpoint_result = find_endpoint(
+        df, rolling_window_minutes=30.0, sustain_minutes=30.0, min_baseline_fraction=0.25
+    )
+    endpoint_ts = endpoint_result[0] if isinstance(endpoint_result, tuple) else endpoint_result
+
+    rows = []
+    for contact_eff in contact_efficiencies:
+        tube = make_anchored_tube(
+            profile=geometry_profile,
+            fill_volume_m3=fill_volume_m3,
+            contact_efficiency=contact_eff,
+        )
+        try:
+            segments = build_segments(
+                df=df,
+                primary_phase_code=phase_code,
+                tube=tube,
+                fill_volume_m3=fill_volume_m3,
+                endpoint_timestamp=endpoint_ts,
+                shelf_temp_std_threshold=0.1,
+                pressure_std_threshold=5.0,
+            )
+            if len(segments) < 2:
+                raise RuntimeError(f"only {len(segments)} segment(s) found")
+            fitted = fit_parameters_joint(
+                segments,
+                use_transient=use_transient,
+                use_hybrid=use_hybrid,
+            )
+            step4_rms = np.nan
+            for label, rms in fitted.get("per_segment_rms_k", {}).items():
+                if "step=4" in label or "Step 4" in label or label.endswith("4"):
+                    step4_rms = rms
+                    break
+            rows.append({
+                "contact_efficiency": contact_eff,
+                "Kv": fitted["Kv"],
+                "Rp0": fitted["Rp0"],
+                "A1": fitted["A1"],
+                "A2": fitted["A2"],
+                "overall_rms_k": fitted["rms_error_k"],
+                "step_4_rms_k": step4_rms,
+                "total_htc": fitted["Kv"] * tube.contact_area_m2(tube.fill_height(fill_volume_m3)),
+                "error": None,
+            })
+        except Exception as exc:  # keep sweeping; record per-row failure
+            rows.append({
+                "contact_efficiency": contact_eff,
+                "Kv": np.nan, "Rp0": np.nan, "A1": np.nan, "A2": np.nan,
+                "overall_rms_k": np.nan, "step_4_rms_k": np.nan,
+                "total_htc": np.nan, "error": str(exc),
+            })
+    return pd.DataFrame(rows)
+
 
 app = Flask(__name__)
 
@@ -95,7 +200,7 @@ HTML_TEMPLATE = """
             font-weight: 600;
             color: #34495e;
         }
-        input[type="text"], input[type="number"] {
+        input[type="text"], input[type="number"], select {
             width: 100%;
             padding: 10px;
             border: 1px solid #ddd;
@@ -202,21 +307,49 @@ HTML_TEMPLATE = """
             </div>
             
             <div class="section">
-                <h2>⚙️ Model Parameters</h2>
+                <h2>&#128207; Geometry (single measured anchor — E-GEOM-ANCHOR-001)</h2>
+                <div style="margin-bottom: 15px; padding: 10px; background: #fff8e1; border-left: 4px solid #f39c12; border-radius: 4px;">
+                    <strong>Anchored mode is the only trusted geometry for this batch.</strong><br>
+                    Measured anchor: <strong>16.0 &#xB5;L &#8596; 4.0 mm fill height</strong> (production PCR tubes).<br>
+                    Fill height is FIXED at 4.0 mm; multi-point calibration is <strong>DEFERRED</strong>
+                    (open assumption A-GEOM-004) and is <strong>mandatory before any recipe
+                    optimization or advisory MPC use</strong>.
+                </div>
+                <div class="form-group">
+                    <label for="geometry_profile">Area profile (explicit assumption):</label>
+                    <select id="geometry_profile" name="geometry_profile">
+                        <option value="cone_tip" selected>cone_tip (default) &#8212; r(h) = k&#183;h, V(H) = (&#960;/3)k&#178;H&#179;</option>
+                        <option value="scaled_frustum">scaled_frustum &#8212; A(h) = c&#183;A_ideal(h), V(H) = c&#183;V_ideal(H)</option>
+                    </select>
+                    <div class="help-text">CLI equivalent: --geometry-profile {cone_tip, scaled_frustum}. Both profiles are pinned so V(4.0 mm) = anchor volume exactly.</div>
+                </div>
+                <div class="form-group">
+                    <label for="contact_efficiency">Contact efficiency:</label>
+                    <input type="number" id="contact_efficiency" name="contact_efficiency" value="0.22" step="0.01" min="0.01" max="1.0">
+                    <div class="help-text">Effective thermal contact fraction (default 0.22 per Graberg thesis)</div>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="anchored_mode" name="anchored_mode" checked disabled>
+                    <label for="anchored_mode">Anchored geometry (16.0 &#xB5;L = 4.0 mm) &#8212; locked for this batch</label>
+                </div>
+                <div class="form-group">
+                    <label for="calibration">Calibration Points (vol_ul:height_mm) &#8212; DEFERRED / IGNORED:</label>
+                    <input type="text" id="calibration" name="calibration" placeholder="(deferred &#8212; leave empty)" autocomplete="off">
+                    <div class="help-text" style="color:#c0392b;">&#9888; Multi-point calibration is deferred (A-GEOM-004). In anchored mode this field is IGNORED with a loud warning; do not rely on it until calibration is completed.</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>&#9881;&#65039; Model Parameters</h2>
                 <div class="form-group">
                     <label for="phase_code">Primary Phase Code:</label>
                     <input type="text" id="phase_code" name="phase_code" value="6" placeholder="e.g., 6">
                     <div class="help-text">The value in the Phase column that indicates primary drying</div>
                 </div>
                 <div class="form-group">
-                    <label for="fill_volume">Fill Volume (µL):</label>
-                    <input type="number" id="fill_volume" name="fill_volume" value="12" step="0.1" min="0">
-                    <div class="help-text">Example values: 6, 12, 20 µL</div>
-                </div>
-                <div class="form-group">
-                    <label for="calibration">Calibration Points (optional):</label>
-                    <input type="text" id="calibration" name="calibration" placeholder="6:1.8 12:2.9 20:4.1">
-                    <div class="help-text">Format: vol_ul:height_mm (space-separated)</div>
+                    <label for="fill_volume">Fill Volume (&#xB5;L):</label>
+                    <input type="number" id="fill_volume" name="fill_volume" value="16" step="0.1" min="0">
+                    <div class="help-text">Anchor: 16.0 &#xB5;L (= 4.0 mm). Fill HEIGHT stays fixed at 4.0 mm; this value scales the anchor volume for the active area profile.</div>
                 </div>
             </div>
             
@@ -366,9 +499,27 @@ def run_pipeline():
         
         report_out = request.form.get('report_out', 'fit_report.txt')
         phase_code_str = request.form.get('phase_code', '6')
-        fill_volume_ul = float(request.form.get('fill_volume', '12'))
+        fill_volume_ul = float(request.form.get('fill_volume', str(ANCHOR_FILL_VOLUME_UL)))
         calib_str = request.form.get('calibration', '')
-        
+
+        # Anchored geometry (E-GEOM-ANCHOR-001) is the only mode for this batch;
+        # the locked checkbox exists for display, and the profile select is the
+        # GUI equivalent of CLI --geometry-profile.
+        anchored_mode = True
+        geometry_profile = request.form.get('geometry_profile', 'cone_tip')
+        if geometry_profile not in GEOMETRY_PROFILES:
+            return jsonify({
+                'error': f"Invalid geometry profile {geometry_profile!r}; "
+                         f"must be one of {list(GEOMETRY_PROFILES)}"
+            }), 400
+
+        try:
+            contact_efficiency = float(request.form.get('contact_efficiency', '0.22'))
+        except ValueError:
+            return jsonify({'error': 'Invalid contact_efficiency value'}), 400
+        if not (0.0 < contact_efficiency <= 1.0):
+            return jsonify({'error': 'contact_efficiency must be in (0, 1]'}), 400
+
         use_min_temp = request.form.get('use_min_temp') == 'on'
         use_transient = request.form.get('use_transient') == 'on'
         use_hybrid = request.form.get('hybrid_mode') == 'on'
@@ -399,11 +550,31 @@ def run_pipeline():
         log(f"\nInput file: {input_file.filename}", 'info')
         log(f"Primary phase code: {phase_code_str}", 'info')
         log(f"Fill volume: {fill_volume_ul} µL", 'info')
-        
+
+        # --- Geometry mode banner (anchored is the only trusted mode) ------
+        log("", 'info')
+        log("=" * 68, 'warning')
+        log("GEOMETRY MODE: ANCHORED (event E-GEOM-ANCHOR-001)", 'warning')
+        log(f"  Measured anchor: {ANCHOR_FILL_VOLUME_UL} uL = {ANCHOR_FILL_HEIGHT_MM} mm fill height", 'warning')
+        log(f"  Fill height FIXED at {ANCHOR_FILL_HEIGHT_MM} mm for this batch (no interpolation).", 'warning')
+        log(f"  Active area profile (--geometry-profile): {geometry_profile}", 'warning')
+        log("  Multi-point calibration DEFERRED (A-GEOM-004) — MANDATORY before", 'warning')
+        log("  any recipe optimization or advisory MPC use.", 'warning')
+        log("=" * 68, 'warning')
+
         if calib_str.strip():
-            log(f"Calibration points: {calib_str}", 'info')
+            log("", 'error')
+            log("*** LOUD WARNING: Calibration points supplied ("
+                + calib_str.strip() + ") but anchored mode IGNORES them. ***", 'error')
+            log("*** In anchored mode the fill height is FIXED at "
+                f"{ANCHOR_FILL_HEIGHT_MM} mm; --calib interpolation is deferred "
+                "(A-GEOM-004) and NOT applied. ***", 'error')
+            log("", 'error')
         
         log(f"\nOptions:", 'info')
+        log(f"  Geometry mode: anchored (fill height fixed at {ANCHOR_FILL_HEIGHT_MM} mm)", 'info')
+        log(f"  Geometry profile (--geometry-profile): {geometry_profile}", 'info')
+        log(f"  Contact efficiency: {contact_efficiency}", 'info')
         log(f"  Use minimum temp: {use_min_temp}", 'info')
         log(f"  Transient mode: {use_transient}", 'info')
         log(f"  Hybrid mode: {use_hybrid}", 'info')
@@ -430,13 +601,20 @@ def run_pipeline():
         # Convert user inputs
         phase_code = coerce_phase_code(df, phase_code_str)
         fill_volume_m3 = fill_volume_ul * 1e-9
-        
-        # Parse calibration
-        calibration_points = parse_calib(calib_str) if calib_str.strip() else []
-        log(f"  Calibration points parsed: {len(calibration_points)}", 'info')
-        
-        # Use calibrated geometry
-        tube = CalibratedPCRTubeGeometry(calibration_points=calibration_points)
+
+        # Anchored geometry (E-GEOM-ANCHOR-001): single measured anchor,
+        # selectable area profile. Calibration points are NEVER interpolated
+        # in anchored mode — any supplied --calib string is ignored (loud
+        # warning already logged above).
+        calibration_points = []
+        tube = AnchoredTubeGeometry(
+            fill_volume_m3=fill_volume_m3,
+            fill_height_m=ANCHOR_FILL_HEIGHT_MM * 1e-3,  # fixed at the measured 4.0 mm
+            profile=geometry_profile,
+            contact_efficiency=contact_efficiency,
+        )
+        log(f"  AnchoredTubeGeometry(profile={geometry_profile!r}, "
+            f"H={tube.H * 1e3:.1f} mm, V(H)={tube.V(tube.H) * 1e6:.2f} uL)", 'success')
         
         # Detect primary drying endpoint using Pirani decline transition
         log("\n[2.5/6] Detecting primary drying endpoint (Pirani decline transition)...", 'info')
@@ -537,12 +715,33 @@ def run_pipeline():
             f"Input file: {input_file.filename}",
             f"Primary phase code used: {phase_code}",
             f"Fill volume: {fill_volume_ul} uL",
+            "",
+            "=== Geometry (E-GEOM-ANCHOR-001: single measured anchor) ===",
+            "Geometry mode: ANCHORED — fill height FIXED at 4.0 mm (no --calib interpolation)",
+            "Measured anchor: 16.0 uL = 4.0 mm fill height (production PCR tubes)",
+            f"Active area profile (--geometry-profile): {geometry_profile}",
+            "Multi-point calibration: DEFERRED (A-GEOM-004) — MANDATORY before any",
+            "recipe optimization or advisory MPC use.",
+            "Ice mass is DERIVED from L only: ice_mass = RHO_ICE * (V(H) - V(H - L)).",
+            f"Simulated endpoint definition: first time L >= H ({ANCHOR_FILL_HEIGHT_MM:.1f} mm); no extrapolation fallback.",
+            "",
+            f"Geometry table for active profile '{geometry_profile}' (h vs V(h) vs A(h), 0.5 mm steps):",
+            f"  {'h (mm)':>8} | {'V (uL)':>12} | {'A (mm^2)':>12}",
+            "  " + "-" * 40,
+        ]
+        for h_m, v_m3, a_m2 in build_geometry_table_rows(tube, h_step_m=0.5e-3):
+            lines.append(
+                f"  {h_m * 1e3:>8.1f} | {v_m3 * 1e6:>12.4f} | {a_m2 * 1e6:>12.4f}"
+            )
+        lines += [
+            "",
             f"Pressure column used: {pressure_col}",
             f"Product temperature column used: {product_temp_col}",
             f"Using minimum probe temperature (ice-front approx): {use_min_temp}",
             f"Using transient mode (for multi-step ramps): {use_transient and not use_hybrid}",
             f"Using hybrid mode (shelf-setpt based Hold/Ramp detection): {use_hybrid}",
-            f"Calibration points used: {len(calibration_points)}",
+            f"Contact efficiency: {contact_efficiency}",
+            f"Calibration points used: {len(calibration_points)} (anchored mode ignores --calib)",
             "",
             "Detected recipe setpoints (Hold vs Ramp):",
         ]
@@ -584,6 +783,26 @@ def run_pipeline():
         
         for label, rms in fitted.get("per_segment_rms_k", {}).items():
             lines.append(f"  {label}: {rms:.6f} K")
+
+        # Per-segment residual-sign / probe-spread diagnostics (task 6):
+        # mean & median residual sign (simulated minus measured) and the
+        # median probe spread (max-min of TP01..TP04).
+        seg_diags = fitted.get("per_segment_diagnostics", {})
+        if seg_diags:
+            lines += [
+                "",
+                "Per-segment residual diagnostics (residual = simulated - measured):",
+                f"  {'segment':<28} {'mean (K)':>10} {'median (K)':>11} {'sign':>9} {'med spread (K)':>15}",
+                "  " + "-" * 78,
+            ]
+            for label, d in seg_diags.items():
+                spread = d.get("median_probe_spread_k")
+                spread_str = f"{spread:.3f}" if spread is not None else "n/a"
+                lines.append(
+                    f"  {label:<28} {d['mean_residual_k']:>+10.4f} "
+                    f"{d['median_residual_k']:>+11.4f} "
+                    f"{d['residual_sign']:>9} {spread_str:>15}"
+                )
         
         # Add state continuity diagnostics if using continuous simulation
         if use_transient_final or use_hybrid:
@@ -671,28 +890,36 @@ def run_pipeline():
             except Exception as exc:
                 log(f"[warning] Failed to generate residual plots: {exc}", 'warning')
         
+        sensitivity_csv_filename = None
+        sensitivity_png_filename = None
+
         # Run contact area sensitivity analysis if requested
         if run_sensitivity:
             log("\n[7/7] Running contact area sensitivity analysis...", 'info')
             try:
                 from sensitivity_contact_area import (
-                    CONTACT_EFFICIENCY_VALUES,
-                    run_sensitivity_analysis,
                     print_summary_table,
                     find_optimal_contact_efficiency,
                     generate_plot,
                 )
-                
-                # Run sensitivity analysis
-                sens_results_df, sens_endpoint_diagnostics = run_sensitivity_analysis(
-                    input_csv=input_path,
+
+                # Anchored-mode sweep: rebuilds an AnchoredTubeGeometry with the
+                # ACTIVE profile for every contact efficiency value (the legacy
+                # run_sensitivity_analysis() still uses CalibratedPCRTubeGeometry,
+                # which contradicts E-GEOM-ANCHOR-001).
+                sens_results_df = _anchored_sensitivity_fit(
+                    input_path=input_path,
                     primary_phase_code=phase_code,
                     fill_volume_ul=fill_volume_ul,
-                    calib_points=calibration_points,
+                    contact_efficiencies=CONTACT_EFFICIENCY_VALUES,
+                    geometry_profile=geometry_profile,
                     use_min_temp=use_min_temp,
                     use_transient=use_transient_final,
                     use_hybrid=use_hybrid,
                 )
+                sens_endpoint_diagnostics = {}
+                log(f"  Sweep mode: ANCHORED profile={geometry_profile} "
+                    f"(contact efficiency values: {CONTACT_EFFICIENCY_VALUES})", 'info')
                 
                 # Print summary table to log
                 log("\n=== CONTACT EFFICIENCY SENSITIVITY ANALYSIS ===", 'info')
@@ -764,7 +991,7 @@ def run_pipeline():
             'log': log_entries,
             'report_url': f'/download/{report_out}'
         }
-        if run_sensitivity and 'sensitivity_csv_filename' in locals():
+        if sensitivity_csv_filename and sensitivity_png_filename:
             response_data['sensitivity_csv_url'] = f'/download/{sensitivity_csv_filename}'
             response_data['sensitivity_png_url'] = f'/download/{sensitivity_png_filename}'
         
