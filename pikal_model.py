@@ -374,7 +374,7 @@ def fit_parameters_joint(
     use_transient: bool = False,
     use_hybrid: bool = False,
     endpoint_time_s: float | None = None,
-    mass_balance_weight: float = 1.0
+    mass_balance_weight: float | None = None
 ) -> dict:
     """Fit ONE shared {Kv, Rp0, A1, A2} across multiple segments.
     
@@ -400,9 +400,14 @@ def fit_parameters_joint(
         Detected primary-drying endpoint time in seconds from start of primary drying.
         If provided, a mass-balance constraint is added to enforce that simulated ice
         depletes at this detected endpoint.
-    mass_balance_weight : float, default 1.0
+    mass_balance_weight : float, optional
         Weight for the mass-balance residual term in the joint fit.
-        
+        If None (default), the weight is AUTO-scaled inside resid() to
+        sqrt(N_temperature_residuals), so that a 100% endpoint error costs
+        roughly the same as the full temperature misfit. A single scalar
+        residual with weight 1.0 is negligible against ~1000 temperature
+        residuals and cannot move the optimizer.
+
     Returns
     -------
     fitted : dict
@@ -413,16 +418,18 @@ def fit_parameters_joint(
         - per_segment_rms_k: Per-segment RMS errors
         - simulated_endpoint_time_s: Simulated endpoint time (if endpoint_time_s provided)
         - mass_balance_residual: Mass-balance residual value (if endpoint_time_s provided)
+        - mass_balance_penalty_share: Fraction of the final total sum of squares
+          contributed by the squared mass-balance residual (None if inactive)
     """
     guess = initial_guess or dict(Kv=15.0, Rp0=2e4, A1=1e6, A2=100.0)
     x0 = np.array([guess["Kv"], guess["Rp0"], guess["A1"], guess["A2"]], dtype=float)
     
     # Store endpoint_time_s in outer scope for use in resid function
     _endpoint_time_s = endpoint_time_s
-    _mass_balance_weight = mass_balance_weight
+    _mass_balance_weight = mass_balance_weight  # None => AUTO scaling (see resid)
 
     # Track whether the mass-balance penalty branch actually executed during the fit
-    _mass_balance_state = {"active": False}
+    _mass_balance_state = {"active": False, "weight_used": None}
 
     def compute_simulated_endpoint_time(ice_mass_trajectories: list[np.ndarray], 
                                          t_arrays: list[np.ndarray],
@@ -500,7 +507,10 @@ def fit_parameters_joint(
                 segments, Kv, Rp0, A1, A2, use_hybrid=use_hybrid
             )
             out = [all_Tp_sim[i] - segments[i].Tp_measured_k for i in range(len(segments))]
-            
+
+            # Number of temperature residuals across all concatenated segments.
+            n_temperature_residuals = sum(len(r) for r in out)
+
             # Add mass-balance residual if endpoint_time_s is provided
             if _endpoint_time_s is not None and _endpoint_time_s > 0:
                 # Calculate initial ice mass from first segment
@@ -513,8 +523,18 @@ def fit_parameters_joint(
                 )
                 _mass_balance_state["active"] = True
 
+                # AUTO weight scaling: when mass_balance_weight is None, scale the
+                # single scalar mass residual by sqrt(N_temperature_residuals) so a
+                # 100% endpoint error costs roughly the same as the full temperature
+                # misfit (a weight of 1.0 is negligible against ~1000 temperature
+                # residuals and cannot move the optimizer).
+                effective_weight = _mass_balance_weight
+                if effective_weight is None:
+                    effective_weight = float(np.sqrt(max(n_temperature_residuals, 1)))
+                _mass_balance_state["weight_used"] = effective_weight
+
                 # Normalized mass-balance residual
-                mass_residual = _mass_balance_weight * (simulated_endpoint - _endpoint_time_s) / _endpoint_time_s
+                mass_residual = effective_weight * (simulated_endpoint - _endpoint_time_s) / _endpoint_time_s
                 out.append(np.array([mass_residual]))
         else:
             # Legacy mode: independent segments (no state continuity)
@@ -545,6 +565,7 @@ def fit_parameters_joint(
     fitted["simulated_endpoint_time_s"] = None
     fitted["mass_balance_residual"] = None
     fitted["mass_balance_active"] = bool(_mass_balance_state["active"])
+    fitted["mass_balance_penalty_share"] = None
 
     # Calculate per-segment RMS errors and mass-balance diagnostics using continuous simulation
     per_segment = {}
@@ -567,9 +588,42 @@ def fit_parameters_joint(
             simulated_endpoint = compute_simulated_endpoint_time(
                 all_ice_mass_trajectories, all_t_arrays, initial_ice_mass
             )
+
+            # Resolve the effective penalty weight at the final parameters.
+            # mass_balance_weight=None means AUTO: sqrt(N_temperature_residuals),
+            # computed from the concatenated segment lengths (same rule as resid()).
+            n_temperature_residuals = sum(len(seg.t_s) for seg in segments)
+            effective_weight = mass_balance_weight
+            if effective_weight is None:
+                effective_weight = float(np.sqrt(max(n_temperature_residuals, 1)))
+            if _mass_balance_state.get("weight_used") is not None:
+                effective_weight = float(_mass_balance_state["weight_used"])
+
+            mass_residual_final = effective_weight * (simulated_endpoint - endpoint_time_s) / endpoint_time_s
+
             fitted["simulated_endpoint_time_s"] = simulated_endpoint
             fitted["detected_endpoint_time_s"] = endpoint_time_s
-            fitted["mass_balance_residual"] = mass_balance_weight * (simulated_endpoint - endpoint_time_s) / endpoint_time_s
+            fitted["mass_balance_residual"] = mass_residual_final
+
+            # Penalty share of cost: (mass_residual**2) / (total sum of squares),
+            # evaluated at the FINAL fitted parameters. Uses the optimizer's final
+            # residual vector when available (temperature SS + squared mass term).
+            temp_ss_final = float(
+                sum(np.sum((all_Tp_sim[i] - segments[i].Tp_measured_k) ** 2)
+                    for i in range(len(segments)))
+            )
+            mass_term_for_ss = mass_residual_final
+            try:
+                final_fun = np.asarray(getattr(result, "fun", None), dtype=float)
+                if final_fun is not None and len(final_fun) == n_temperature_residuals + 1:
+                    mass_term_for_ss = float(final_fun[-1])
+                    temp_ss_final = float(np.sum(final_fun[:-1] ** 2))
+            except Exception:
+                pass
+            total_ss = temp_ss_final + mass_term_for_ss ** 2
+            fitted["mass_balance_penalty_share"] = (
+                float(mass_term_for_ss ** 2 / total_ss) if total_ss > 0 else 0.0
+            )
             
             # Store detailed mass-balance physics for reporting
             fitted["initial_ice_mass_kg"] = initial_ice_mass

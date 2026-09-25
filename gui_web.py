@@ -509,13 +509,19 @@ def run_pipeline():
         fitted = fit_parameters_joint(
             segments,
             use_transient=use_transient_final,
-            use_hybrid=use_hybrid
+            use_hybrid=use_hybrid,
+            endpoint_time_s=endpoint_time_from_start,
+            mass_balance_weight=None
         )
         
         if not fitted['converged']:
             log("[warning] Optimization did not converge!", 'warning')
         else:
             log("  Fit converged successfully", 'success')
+
+        # Log the mass-balance closure lines to the web GUI log as well
+        for mb_line in build_mass_balance_lines(fitted, endpoint_time_from_start):
+            log(f"  {mb_line}", 'info')
         
         log(f"\nFitted parameters:", 'info')
         log(f"  Kv  = {fitted['Kv']:.6f}", 'info')
@@ -559,7 +565,11 @@ def run_pipeline():
             f"Post-drying baseline (median Pirani-CM diff, late phase): {diagnostics.get('post_baseline', 'N/A'):.3f} Pa" if diagnostics.get('post_baseline') is not None else "",
             f"Transition threshold used: {diagnostics.get('threshold', 'N/A'):.3f} Pa" if diagnostics.get('threshold') is not None else "",
             f"Detected endpoint timestamp: {endpoint_ts}",
+            f"Endpoint time from start of primary drying: {endpoint_time_from_start:.1f} s" if endpoint_time_from_start is not None else "",
             f"Transition detected: {diagnostics.get('detected', False)}",
+            "",
+            "=== Mass-Balance Constraint ===",
+        ] + build_mass_balance_lines(fitted, endpoint_time_from_start) + [
             "",
             "Fitted parameters:",
             f"  Kv  = {fitted['Kv']:.6f}",

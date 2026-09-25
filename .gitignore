@@ -1,6 +1,7 @@
-# Compiled and build artifacts
+# Python bytecode and cache
 __pycache__/
 *.pyc
 
-# Logs and temp files
-fit_report.txt
+# Environment files
+.env
+.env.local

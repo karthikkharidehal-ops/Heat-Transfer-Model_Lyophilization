@@ -250,7 +250,7 @@ def main():
             use_transient=use_transient,
             use_hybrid=use_hybrid,
             endpoint_time_s=endpoint_time_from_start,
-            mass_balance_weight=1.0
+            mass_balance_weight=None
         )
     except Exception as exc:
         raise SystemExit(f"[error] Joint fit failed: {exc}")
