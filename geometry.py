@@ -173,9 +173,10 @@ class AnchoredTubeGeometry(PCRTubeGeometry):
       V(h)  = integral of A(h') dh' from 0 to h  (closed-form, exact)
       A(h)  = dV/dh (analytic)
       r(h)  = sqrt(A(h)/pi)
-      ice mass is DERIVED from L only:
-          ice_mass(L) = RHO_ICE * (V(H) - V(H - L))
-      — never accumulated/integrated over time elsewhere.
+      ice mass is DERIVED from L only (state law E-PHYS-STATELAW-001):
+          ice_mass(L) = RHO_ICE * V(H - L)
+      — remaining frozen-column mass; never accumulated/integrated over
+      time elsewhere. At L=0 this is RHO_ICE*V(H); at L>=H it is ~0.
 
     Multi-point calibration is deferred; this class ignores any
     calibration points passed to it.
@@ -249,12 +250,23 @@ class AnchoredTubeGeometry(PCRTubeGeometry):
         return self.A(h_from_bottom_m)
 
     def derived_ice_mass_kg(self, L_m: float, rho_ice: float) -> float:
-        """Ice mass (kg) remaining when the dried layer has depth L from the top.
+        """REMAINING ice mass (kg) when the dried layer has depth L from the top.
 
-        DERIVED, never integrated:  ice_mass = rho_ice * (V(H) - V(H - L)).
+        STATE LAW (E-PHYS-STATELAW-001) — DERIVED, never integrated:
+
+            ice_mass(L) = rho_ice * V(H - L)
+
+        The frozen column occupies heights [0, H - L]; the top L metres are
+        dry porous cake. Boundary behaviour (enforced by
+        tests/test_state_law.py):
+          - L = 0   -> ice_mass = rho_ice * V(H)      (full anchor mass)
+          - L >= H  -> ice_mass <= 1% of initial      (tube empty)
+
+        NOTE: an earlier revision used rho*(V(H) - V(H-L)), which returns the
+        SUBLIMED mass and INCREASES with L — inverted state law. Do not use.
         """
         L = min(max(float(L_m), 0.0), self.H)
-        return float(rho_ice * (self.V(self.H) - self.V(self.H - L)))
+        return float(rho_ice * self.V(self.H - L))
 
     def lateral_area_m2(self, h: float) -> float:
         """True lateral (wall) contact area (m^2) between the tube wall and the

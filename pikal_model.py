@@ -11,6 +11,38 @@ DH_S = 2.838e6      # J/kg, latent heat of ice sublimation
 RHO_ICE = 918.0     # kg/m^3
 
 
+class NoRootError(RuntimeError):
+    """Raised when the steady-state/transient heat/mass balance has NO root
+    for Tp in [Ts - 60, Ts) (event E-PHYS-STATELAW-001, defect 3).
+
+    Physically this means the supplied heat Kv*(Ts - Tp)*contact_area exceeds
+    the maximum sublimation capacity (p_ice(Tp) - Pc)/(Rp + Rs) * A_front * DH_S
+    over the entire admissible Tp window: there is NO product temperature at
+    which the energy balance closes. This is a STRUCTURAL model failure (Kv or
+    contact area too high), not a numerical hiccup — it must never be masked
+    by silently pinning Tp := Ts - 5.0.
+
+    Carries the full solver context so callers can exclude the timestep from
+    residuals and report why no root exists.
+    """
+
+    def __init__(self, Ts, Pc, Rp, contact_area, A_front, message=None):
+        self.Ts = float(Ts)
+        self.Pc = float(Pc)
+        self.Rp = float(Rp)
+        self.contact_area = float(contact_area)
+        self.A_front = float(A_front)
+        if message is None:
+            message = (
+                "No root in heat/mass balance for Tp in [Ts-60, Ts): "
+                f"Ts={self.Ts:.4f} K, Pc={self.Pc:.4f} Pa, Rp={self.Rp:.6g} "
+                f"m*s*Pa/kg, contact_area={self.contact_area:.6g} m^2, "
+                f"A_front={self.A_front:.6g} m^2. Heat input exceeds "
+                "sublimation capacity (Kv or contact area structurally too high)."
+            )
+        super().__init__(message)
+
+
 def p_ice(Tp_k: float) -> float:
     """Ice vapor pressure (Pa) vs temperature (K); valid ~-80C to 0C."""
     T = float(Tp_k)
@@ -57,7 +89,17 @@ def solve_Tp(
         Mass flux per unit area (kg/m²·s)
     Tp_k : float
         Product temperature at current timestep (K)
-    
+
+    Raises
+    ------
+    NoRootError
+        If the heat/mass balance has NO root for Tp in [Ts-60, Ts). The silent
+        fallback Tp := Ts - 5.0 that previously masked this case is ABOLISHED
+        (event E-PHYS-STATELAW-001, defect 3): it manufactured a constant
+        ~-5.7 K Hold-step residual by pretending a physical impossibility was
+        merely an awkward solve. Callers must catch NoRootError per timestep,
+        exclude that timestep from residuals, and count exclusions.
+
     Notes
     -----
     When Tp_prev_k, dt, and ice_mass are provided, the solver includes a transient
@@ -86,13 +128,19 @@ def solve_Tp(
             return float(q_supplied - q_consumed)
 
     lo, hi = Ts_k - 60.0, Ts_k - 0.01
-    
+
     try:
         # Cast to float and ignore Pylance warning about brentq potentially returning a tuple
         Tp_k = float(brentq(residual, lo, hi, xtol=1e-4))  # type: ignore[arg-type]
-    except ValueError:
-        Tp_k = float(Ts_k - 5.0)
-        
+    except ValueError as exc:
+        # NO SILENT FALLBACK (E-PHYS-STATELAW-001, defect 3): brentq's
+        # ValueError means residual(lo) and residual(hi) share the same sign,
+        # i.e. there is NO admissible product temperature at which the energy
+        # balance closes. The old code masked this by pinning Tp := Ts - 5.0,
+        # manufacturing a constant Hold-step bias. Raise instead; callers must
+        # catch per timestep, exclude it from residuals, and count exclusions.
+        raise NoRootError(Ts_k, Pc_pa, Rp, contact_area, A_front) from exc
+
     flux = max((p_ice(Tp_k) - Pc_pa) / (Rp + Rs), 0.0) if (Rp + Rs) > 0 else 0.0
     return float(flux), float(Tp_k)
 
@@ -101,10 +149,10 @@ def simulate_cycle(
     t_s: np.ndarray, Ts_k: np.ndarray, Pc_pa: np.ndarray,
     tube: PCRTubeGeometry, fill_volume_m3: float,
     Kv: float, Rp0: float, A1: float, A2: float,
-    Rs: float = 0.0, use_transient: bool = False
-) -> np.ndarray:
+    Rs: float = 0.0, use_transient: bool = False, return_masks: bool = False
+) -> np.ndarray | tuple[np.ndarray, np.ndarray, bool]:
     """Forward-simulate product temperature over a primary-drying window.
-    
+
     Parameters
     ----------
     t_s : np.ndarray
@@ -127,22 +175,52 @@ def simulate_cycle(
         If True, include transient heat accumulation term to account for
         non-steady conditions during ramp steps. Recommended when there are
         4-5 ramp steps where steady-state assumption breaks down.
-        
+    return_masks : bool, default False
+        If True, return (Tp_sim, valid_mask, endpoint_reached) instead of
+        Tp_sim only. valid_mask[i] is False for post-primary timesteps
+        (at/after the simulated endpoint L >= H) and must be used to exclude
+        them from residual computations.
+
     Returns
     -------
     Tp_sim : np.ndarray
-        Simulated product temperature history (K)
+        Simulated product temperature history (K). Timesteps at/after the
+        simulated endpoint (first time L >= H) carry NaN and MUST be excluded
+        from any residual computation (post-primary: the primary-drying model
+        never simulates through an empty tube).
+    valid_mask : np.ndarray (bool), endpoint_reached : bool
+        Only returned when ``return_masks=True``.
+
+    Raises
+    ------
+    NoRootError
+        Propagated from solve_Tp when the heat/mass balance has no root
+        (silent Tp := Ts - 5.0 fallback abolished, E-PHYS-STATELAW-001).
+
+    Notes
+    -----
+    STATE LAW (E-PHYS-STATELAW-001):
+      - L (dried-layer thickness from the top) is the unified state variable,
+        clamped to [0, H].
+      - Remaining ice mass is DERIVED, never integrated:
+            ice_mass(L) = RHO_ICE * V(H - L)
+        At L=0 this equals RHO_ICE*V(H); at L>=H it is ~0 (<= 1% initial).
+      - Simulated endpoint = first timestep with L >= H. The integration
+        TERMINATES there; later timesteps are post-primary and masked out.
+      - NoRootError from solve_Tp propagates (no silent Tp := Ts - 5 pin).
     """
     n = len(t_s)
-    Tp_sim = np.zeros(n)
-    fill_height = tube.fill_height(fill_volume_m3)
+    Tp_sim = np.full(n, np.nan)
+    valid_mask = np.zeros(n, dtype=bool)
+    fill_height = tube.fill_height(fill_volume_m3)  # H (4.0 mm anchor in anchored mode)
     contact_area = tube.contact_area_m2(fill_height)
-    L = 0.0  # UNIFIED STATE VARIABLE: dried-layer thickness from the top (m).
-             # Ice mass is DERIVED from L (never accumulated independently):
-             #   ice_mass = rho_ice * (V(H) - V(H - L))
+    L = 0.0  # UNIFIED STATE VARIABLE: dried-layer thickness from the top (m),
+             # always clamped to [0, H]. Ice mass is DERIVED from L only:
+             #   ice_mass = rho_ice * V(H - L)   (remaining mass, never accumulated)
+    terminated = False  # True once the simulated endpoint (L >= H) is reached
 
     def _derived_ice_mass() -> float:
-        """Ice mass (kg) consistent with the current front depth L."""
+        """REMAINING ice mass (kg) consistent with the current front depth L."""
         if isinstance(tube, AnchoredTubeGeometry):
             return tube.derived_ice_mass_kg(L, RHO_ICE)
         # Legacy frustum fallback: remaining column volume below the front.
@@ -161,6 +239,12 @@ def simulate_cycle(
         Tp_prev = None
 
     for i in range(n):
+        if terminated:
+            # Post-primary timestep: the tube is empty (L >= H). The
+            # primary-drying model must NEVER simulate through an empty tube,
+            # so Tp stays NaN and the timestep is excluded from residuals.
+            break
+
         Rp = Rp0 + A1 * L / (1.0 + A2 * L)
         A_front = tube.front_area_m2(fill_height, L)
 
@@ -179,22 +263,27 @@ def simulate_cycle(
             )
 
         Tp_sim[i] = Tp_k
+        valid_mask[i] = True
 
         if i < n - 1:
             dt = float(t_s[i + 1] - t_s[i])
             # The dried layer grows by the sublimed ice volume divided by the
-            # LOCAL front area A(front height) — exactly conserving ice mass:
-            # after the step, rho_ice * (V(H) - V(H - L_new)) equals the old
-            # derived mass minus flux*A_front*dt.
+            # LOCAL front area A(front height). With the corrected state law
+            # ice_mass = rho*V(H-L) this exactly conserves mass: the volume
+            # removed from the frozen column equals flux*dt/rho.
             if A_front > 0.0:
                 L += max(flux * dt / RHO_ICE, 0.0) / A_front
-            # Do NOT clamp L at H: the simulated endpoint is defined as the
-            # first time L >= H, so that crossing must remain detectable.
-            # Cap at 2H purely as a numerical guard against runaway growth.
-            L = min(L, 2.0 * fill_height)
+            # CLAMP L to [0, H] (defect 2): L can no longer be integrated past
+            # the fill height. The FIRST time L reaches H IS the simulated
+            # endpoint; terminate the primary-drying integration there.
+            L = min(max(L, 0.0), fill_height)
+            if L >= fill_height:
+                terminated = True
             if use_transient:
                 ice_mass = _derived_ice_mass()  # re-DERIVE, never accumulate
 
+    if return_masks:
+        return Tp_sim, valid_mask, terminated
     return Tp_sim
 
 
@@ -290,17 +379,23 @@ def simulate_continuous_primary_drying(
     segments: list[DryingSegment],
     Kv: float, Rp0: float, A1: float, A2: float, Rs: float = 0.0,
     use_hybrid: bool = False
-) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray],
+           list[np.ndarray], dict]:
     """Simulate primary drying continuously across multiple segments (Steps 2-9).
-    
+
     This maintains continuity of:
-    - Dried layer thickness L (ice front position)
-    - Ice mass
+    - Dried layer thickness L (ice front position), CLAMPED to [0, H]
+      (E-PHYS-STATELAW-001 defect 2: the primary-drying model never
+      integrates past the fill height and never simulates through an
+      empty tube)
+    - Ice mass — DERIVED from L only: ice_mass = RHO_ICE * V(H - L)
+      (remaining mass; E-PHYS-STATELAW-001 defect 1 corrected the earlier
+      inverted derivation rho*(V(H)-V(H-L)) which returned SUBLIMED mass)
     - Product temperature Tp
-    
+
     Across all segments, applying appropriate physics (steady-state vs transient)
     based on whether each segment is a Hold or Ramp step.
-    
+
     Parameters
     ----------
     segments : list[DryingSegment]
@@ -312,24 +407,40 @@ def simulate_continuous_primary_drying(
     use_hybrid : bool, default False
         If True, use steady-state for Hold steps and transient for Ramp steps.
         If False, use transient mode for all segments.
-        
+
     Returns
     -------
     Tp_simulations : list[np.ndarray]
-        List of simulated product temperature arrays, one per segment
+        List of simulated product temperature arrays, one per segment.
+        Post-primary timesteps (at/after the first time L >= H) and timesteps
+        where the heat/mass balance had no root carry NaN — they must be
+        excluded from residual computations.
     t_arrays : list[np.ndarray]
         List of time arrays (seconds from segment start), one per segment
     ice_mass_trajectories : list[np.ndarray]
-        List of ice mass trajectories (kg), one per segment. These are
-        DERIVED from the unified state L at each timestep — never an
-        independently accumulated quantity.
+        List of REMAINING ice-mass trajectories (kg), one per segment. These
+        are DERIVED from the unified state L at each timestep (rho*V(H-L)) —
+        never an independently accumulated quantity.
     front_depth_trajectories : list[np.ndarray]
-        List of dried-layer depth L(t) (m), one per segment. The simulated
-        endpoint is defined on this trajectory: first time L >= H.
+        List of dried-layer depth L(t) (m), one per segment, always within
+        [0, H]. The simulated endpoint is defined on this trajectory: first
+        time L >= H.
+    diagnostics : dict
+        Exclusion bookkeeping (E-PHYS-STATELAW-001):
+        - "n_post_primary_excluded": {label: int} — timesteps dropped because
+          the tube was already empty (L >= H reached earlier).
+        - "n_no_root_excluded": {label: int} — timesteps dropped because the
+          heat/mass balance had NO root (NoRootError from solve_Tp; silent
+          Tp := Ts - 5.0 pinning is abolished).
+        - "segment_lengths": {label: int} — total timesteps per segment.
+        - "hold_flags": {label: bool} — whether the segment is a Hold step.
+        - "endpoint_reached": bool — True once L >= H occurred anywhere.
+        - "endpoint_time_s": float | None — cumulative time of first L >= H.
     """
     # Initialize state variables at the start of primary drying
     # These will be carried forward across all segments
-    L = 0.0  # UNIFIED STATE VARIABLE: dried layer thickness from top (m)
+    L = 0.0  # UNIFIED STATE VARIABLE: dried layer thickness from top (m),
+             # clamped to [0, H] after every update.
     tube = segments[0].tube
     fill_volume_m3 = segments[0].fill_volume_m3
     # H: total ice-column height at the start of primary drying. For the
@@ -339,7 +450,7 @@ def simulate_continuous_primary_drying(
     contact_area = tube.contact_area_m2(fill_height)
 
     def _derived_ice_mass(L_now: float) -> float:
-        """Ice mass (kg) DERIVED from the front depth L: rho*(V(H)-V(H-L))."""
+        """REMAINING ice mass (kg) DERIVED from the front depth L: rho*V(H-L)."""
         if isinstance(tube, AnchoredTubeGeometry):
             return tube.derived_ice_mass_kg(L_now, RHO_ICE)
         remaining_h = max(fill_height - L_now, 0.0)
@@ -359,14 +470,32 @@ def simulate_continuous_primary_drying(
     all_ice_mass_trajectories = []
     all_L_trajectories = []
 
+    # --- exclusion bookkeeping (E-PHYS-STATELAW-001) --------------------
+    def _seg_label(idx: int, seg: DryingSegment) -> str:
+        return seg.label or f"segment_{idx}"
+
+    n_post_primary_excluded: dict[str, int] = {}
+    n_no_root_excluded: dict[str, int] = {}
+    segment_lengths: dict[str, int] = {}
+    hold_flags: dict[str, bool] = {}
+
+    terminated = False          # once L >= H: post-primary, stop simulating
+    cumulative_time_s = 0.0     # time since start of primary drying
+    endpoint_time_s: float | None = None
+
     for seg_idx, seg in enumerate(segments):
+        label = _seg_label(seg_idx, seg)
         n = len(seg.t_s)
-        Tp_sim = np.zeros(n)
-        ice_mass_trajectory = np.zeros(n)  # derived from L at each timestep
-        L_trajectory = np.zeros(n)
+        Tp_sim = np.full(n, np.nan)
+        ice_mass_trajectory = np.full(n, np.nan)  # derived from L at each timestep
+        L_trajectory = np.full(n, np.nan)
+        n_post_primary_excluded[label] = 0
+        n_no_root_excluded[label] = 0
+        segment_lengths[label] = n
+        hold_flags[label] = bool(seg.is_hold_step)
 
         # Debug print for state continuity verification
-        print(f"[STATE-CONTINUITY] Segment {seg_idx} ({seg.label}): L_start = {L:.6f} m, ice_mass = {ice_mass:.9f} kg")
+        print(f"[STATE-CONTINUITY] Segment {seg_idx} ({label}): L_start = {L:.6f} m, ice_mass = {ice_mass:.9f} kg")
 
         # Determine physics mode for this segment
         seg_use_transient = True  # Default to transient for continuity
@@ -376,6 +505,14 @@ def simulate_continuous_primary_drying(
             seg_use_transient = not seg.is_hold_step
 
         for i in range(n):
+            if terminated:
+                # POST-PRIMARY (defect 2): the tube is empty (L >= H was
+                # reached). The primary-drying model must NEVER simulate
+                # through an empty tube. Mark this timestep post-primary,
+                # exclude it from residuals (NaN), and count it.
+                n_post_primary_excluded[label] += 1
+                continue
+
             # Calculate product resistance based on current dried layer thickness
             Rp = Rp0 + A1 * L / (1.0 + A2 * L)
 
@@ -387,45 +524,79 @@ def simulate_continuous_primary_drying(
             ice_mass_trajectory[i] = ice_mass
             L_trajectory[i] = L
 
-            if seg_use_transient and i > 0:
-                # Transient mode: include heat accumulation term
-                dt = float(seg.t_s[i] - seg.t_s[i - 1])
-                flux, Tp_k = solve_Tp(
-                    float(seg.Ts_k[i]), float(seg.Pc_pa[i]), float(Rp), float(Rs),
-                    float(contact_area), float(A_front), float(Kv),
-                    Tp_prev_k=float(Tp_prev), dt=dt, ice_mass=float(ice_mass)
-                )
-                Tp_prev = Tp_k
-            else:
-                # Steady-state mode (for Hold steps in hybrid mode)
-                # Still uses current L (and the ice mass derived from it)
-                flux, Tp_k = solve_Tp(
-                    float(seg.Ts_k[i]), float(seg.Pc_pa[i]), float(Rp), float(Rs),
-                    float(contact_area), float(A_front), float(Kv)
-                )
-                Tp_prev = Tp_k  # Still update for continuity
+            t_abs = cumulative_time_s + float(seg.t_s[i])
+
+            try:
+                if seg_use_transient and i > 0:
+                    # Transient mode: include heat accumulation term
+                    dt = float(seg.t_s[i] - seg.t_s[i - 1])
+                    flux, Tp_k = solve_Tp(
+                        float(seg.Ts_k[i]), float(seg.Pc_pa[i]), float(Rp), float(Rs),
+                        float(contact_area), float(A_front), float(Kv),
+                        Tp_prev_k=float(Tp_prev), dt=dt, ice_mass=float(ice_mass)
+                    )
+                    Tp_prev = Tp_k
+                else:
+                    # Steady-state mode (for Hold steps in hybrid mode)
+                    # Still uses current L (and the ice mass derived from it)
+                    flux, Tp_k = solve_Tp(
+                        float(seg.Ts_k[i]), float(seg.Pc_pa[i]), float(Rp), float(Rs),
+                        float(contact_area), float(A_front), float(Kv)
+                    )
+                    Tp_prev = Tp_k  # Still update for continuity
+            except NoRootError:
+                # DEFECT 3: the heat/mass balance has NO root for Tp. Do NOT
+                # silently pin Tp := Ts - 5.0 (that manufactured the constant
+                # Hold-step bias). Exclude this timestep from residuals and
+                # count it. State L does not advance (flux unknown).
+                Tp_sim[i] = np.nan
+                n_no_root_excluded[label] += 1
+                continue
 
             Tp_sim[i] = Tp_k
 
+            # Simulated endpoint check AT THIS TIMESTEP: if the front has
+            # arrived at the tube bottom (L >= H), this is the endpoint.
+            if L >= fill_height:
+                terminated = True
+                if endpoint_time_s is None:
+                    endpoint_time_s = t_abs
+
             # Update the unified state variable L for the next timestep.
             # Volume sublimed over dt divided by the LOCAL front area keeps
-            # ice_mass == rho*(V(H)-V(H-L)) exactly consistent (no separate
+            # ice_mass == rho*V(H-L) exactly consistent (no separate
             # ice-mass accumulation exists anywhere).
-            if i < n - 1:
+            if i < n - 1 and not terminated:
                 dt = float(seg.t_s[i + 1] - seg.t_s[i])
                 if A_front > 0.0:
                     L += max(flux * dt / RHO_ICE, 0.0) / A_front
-                # L may reach/exceed H (= fill height): that IS the simulated
-                # endpoint. No hard clamp so L >= H remains detectable; cap at
-                # 2H purely as a numerical guard against runaway growth.
-                L = min(L, 2.0 * fill_height)
+                # CLAMP L to [0, H] (defect 2): L can never exceed the fill
+                # height. The first time L reaches H IS the simulated
+                # endpoint; everything after is post-primary.
+                L = min(max(L, 0.0), fill_height)
+                if L >= fill_height:
+                    terminated = True
+                    if endpoint_time_s is None:
+                        # Endpoint occurs at the NEXT timestep's absolute time.
+                        endpoint_time_s = t_abs + dt
+
+        cumulative_time_s += float(seg.t_s[-1]) if n > 0 else 0.0
 
         all_Tp_sim.append(Tp_sim)
         all_t_arrays.append(seg.t_s.copy())
         all_ice_mass_trajectories.append(ice_mass_trajectory)
         all_L_trajectories.append(L_trajectory)
 
-    return all_Tp_sim, all_t_arrays, all_ice_mass_trajectories, all_L_trajectories
+    diagnostics = {
+        "n_post_primary_excluded": n_post_primary_excluded,
+        "n_no_root_excluded": n_no_root_excluded,
+        "segment_lengths": segment_lengths,
+        "hold_flags": hold_flags,
+        "endpoint_reached": bool(terminated),
+        "endpoint_time_s": endpoint_time_s,
+    }
+
+    return all_Tp_sim, all_t_arrays, all_ice_mass_trajectories, all_L_trajectories, diagnostics
 
 
 def fit_parameters_joint(
